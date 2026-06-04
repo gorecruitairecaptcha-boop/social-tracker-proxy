@@ -1,45 +1,230 @@
 /**
- * LinkedIn API Proxy — Cloud Deployment (Render.com)
- * Handles CORS, forwards requests to LinkedIn API.
- * No database needed.
+ * Social Tracker API + LinkedIn Proxy + PostgreSQL
+ * Deployed on Render.com (free tier)
  */
 
 import express from "express";
 import cors from "cors";
+import pg from "pg";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ── Database ──
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL || "postgresql://appone:dgDXXJ5DR5F94USSHlHLaEwEZ0sDZum7@dpg-d8gkqta8qa3s739fbvbg-a/socialtracker",
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+});
+
+async function initDB() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, email VARCHAR(150) UNIQUE NOT NULL, password VARCHAR(255) NOT NULL, role VARCHAR(20) DEFAULT 'member', region VARCHAR(20) DEFAULT 'India', is_active BOOLEAN DEFAULT true, created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, title VARCHAR(300) NOT NULL, description TEXT, category VARCHAR(50), region VARCHAR(20) DEFAULT 'all', page VARCHAR(20) DEFAULT 'both', priority VARCHAR(10) DEFAULT 'medium', target_value INT DEFAULT 1, due_date DATE, recurring BOOLEAN DEFAULT false, recurrence VARCHAR(20) DEFAULT 'daily', status VARCHAR(20) DEFAULT 'pending', assigned_to VARCHAR(50), assigned_by VARCHAR(50), created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS task_completions (id SERIAL PRIMARY KEY, task_id INT REFERENCES tasks(id) ON DELETE CASCADE, user_id INT REFERENCES users(id) ON DELETE CASCADE, completion_date DATE NOT NULL, status VARCHAR(20) DEFAULT 'pending', value INT DEFAULT 0, notes TEXT, link VARCHAR(500), updated_at TIMESTAMP DEFAULT NOW(), UNIQUE(task_id, user_id, completion_date));
+      CREATE TABLE IF NOT EXISTS posts (id SERIAL PRIMARY KEY, post_date DATE NOT NULL, page VARCHAR(20) NOT NULL, content_type VARCHAR(50), title VARCHAR(300), notes TEXT, hashtags VARCHAR(500), likes INT DEFAULT 0, comments INT DEFAULT 0, shares INT DEFAULT 0, impressions INT DEFAULT 0, post_link VARCHAR(500), added_by VARCHAR(50), last_synced_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS page_metrics (id SERIAL PRIMARY KEY, metric_date DATE NOT NULL, page VARCHAR(20) NOT NULL, followers INT DEFAULT 0, new_followers INT DEFAULT 0, impressions INT DEFAULT 0, engagements INT DEFAULT 0, profile_views INT DEFAULT 0, post_reach INT DEFAULT 0, page_views INT DEFAULT 0, unique_visitors INT DEFAULT 0, clicks INT DEFAULT 0, engagement_rate DECIMAL(5,2) DEFAULT 0, source VARCHAR(20) DEFAULT 'manual', created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS employees (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, title VARCHAR(100), team VARCHAR(50), region VARCHAR(20) DEFAULT 'India', linkedin_url VARCHAR(300), photo_url VARCHAR(300), created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS engagement (id SERIAL PRIMARY KEY, post_id VARCHAR(50) NOT NULL, employee_id VARCHAR(50) NOT NULL, type VARCHAR(20) NOT NULL, date DATE NOT NULL, note TEXT, created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS api_config (id SERIAL PRIMARY KEY, config_key VARCHAR(50) UNIQUE NOT NULL, config_value TEXT, updated_at TIMESTAMP DEFAULT NOW());
+    `);
+    // Seed default admin if empty
+    const { rows } = await client.query("SELECT COUNT(*) as c FROM users");
+    if (parseInt(rows[0].c) === 0) {
+      await client.query(`INSERT INTO users (name, email, password, role, region) VALUES
+        ('Admin', 'admin@techwaukee.com', 'admin123', 'admin', 'all'),
+        ('Sneha Reddy', 'sneha@techwaukee.com', 'manager123', 'manager', 'India'),
+        ('Priya Sharma', 'priya@techwaukee.com', 'member123', 'member', 'India')`);
+      await client.query(`INSERT INTO employees (name, title, team, region, linkedin_url) VALUES
+        ('Pavithra M', 'Team Lead', 'Recruitment', 'India', 'https://linkedin.com/in/pavithra-m'),
+        ('Sandhya S', 'Team Lead', 'Recruitment', 'India', 'https://linkedin.com/in/sandhya-s'),
+        ('Vaishnavi A', 'Recruiter', 'US Staffing', 'India', 'https://linkedin.com/in/vaishnavi-a'),
+        ('Asfiya', 'Recruiter', 'US Staffing', 'India', 'https://linkedin.com/in/asfiya'),
+        ('Abinaya J', 'Recruiter', 'India', 'India', 'https://linkedin.com/in/abinaya-j'),
+        ('John', 'Recruiter', 'US Staffing', 'USA', 'https://linkedin.com/in/john'),
+        ('Rajesh Kumar', 'Senior Recruiter', 'India', 'India', 'https://linkedin.com/in/rajesh-kumar'),
+        ('Mike Chen', 'Senior Recruiter', 'US Staffing', 'USA', 'https://linkedin.com/in/mike-chen')`);
+      await client.query(`INSERT INTO api_config (config_key, config_value) VALUES ('techwaukee_org_id', '15078287'), ('linkedin_client_id', '86rz73bd1rfacx')`);
+      console.log("[DB] Seeded default data");
+    }
+    console.log("[DB] Tables ready");
+  } finally { client.release(); }
+}
+
 app.use(cors());
 app.use(express.json());
 
+// ── Helper: LinkedIn fetch ──
 async function liFetch(url, token, options = {}) {
   const res = await fetch(url, {
     method: options.method || "GET",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "LinkedIn-Version": "202604",
-      "X-Restli-Protocol-Version": "2.0.0",
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${token}`, "LinkedIn-Version": "202604", "X-Restli-Protocol-Version": "2.0.0", "Content-Type": "application/json" },
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   const text = await res.text();
-  let data;
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
   return { error: !res.ok, status: res.status, data };
 }
 
-function getToken(req) {
-  const auth = req.headers.authorization;
-  return (auth && auth.startsWith("Bearer ")) ? auth.slice(7) : null;
-}
+function getToken(req) { const a = req.headers.authorization; return a?.startsWith("Bearer ") ? a.slice(7) : null; }
 
-// Health
-app.get("/", (req, res) => res.json({ status: "ok", server: "Social Tracker LinkedIn Proxy" }));
-app.get("/api/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
+// ══ Health ══
+app.get("/", (req, res) => res.json({ status: "ok", server: "Social Tracker API" }));
+app.get("/api/health", async (req, res) => {
+  try { await pool.query("SELECT 1"); res.json({ status: "ok", db: "connected" }); }
+  catch (e) { res.json({ status: "ok", db: "error", error: e.message }); }
+});
 
-// Dashboard metrics
+// ══ AUTH ══
+app.post("/api/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { rows } = await pool.query("SELECT id, name, email, role, region FROM users WHERE email = $1 AND password = $2 AND is_active = true", [email, password]);
+    if (rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
+    res.json({ user: rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ USERS ══
+app.get("/api/users", async (req, res) => {
+  try { const { rows } = await pool.query("SELECT id, name, email, password, role, region, is_active FROM users ORDER BY role, name"); res.json(rows); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/users", async (req, res) => {
+  try {
+    const { name, email, password, role, region } = req.body;
+    const { rows } = await pool.query("INSERT INTO users (name, email, password, role, region) VALUES ($1,$2,$3,$4,$5) RETURNING *", [name, email, password, role || "member", region || "India"]);
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put("/api/users/:id", async (req, res) => {
+  try {
+    const { name, email, password, role } = req.body;
+    await pool.query("UPDATE users SET name=$1, email=$2, password=$3, role=$4 WHERE id=$5", [name, email, password, role, req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete("/api/users/:id", async (req, res) => {
+  try { await pool.query("UPDATE users SET is_active=false WHERE id=$1", [req.params.id]); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ TASKS ══
+app.get("/api/tasks", async (req, res) => {
+  try { const { rows } = await pool.query("SELECT * FROM tasks ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, due_date ASC NULLS LAST"); res.json(rows); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/tasks", async (req, res) => {
+  try {
+    const { title, description, category, region, page, priority, target_value, due_date, recurring, recurrence, status, assigned_to, assigned_by } = req.body;
+    const { rows } = await pool.query("INSERT INTO tasks (title,description,category,region,page,priority,target_value,due_date,recurring,recurrence,status,assigned_to,assigned_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *",
+      [title, description, category, region, page, priority, target_value, due_date || null, recurring, recurrence, status || "pending", assigned_to, assigned_by]);
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put("/api/tasks/:id", async (req, res) => {
+  try {
+    const { status } = req.body;
+    await pool.query("UPDATE tasks SET status=$1 WHERE id=$2", [status, req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete("/api/tasks/:id", async (req, res) => {
+  try { await pool.query("DELETE FROM tasks WHERE id=$1", [req.params.id]); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ TASK COMPLETIONS ══
+app.post("/api/task-completions", async (req, res) => {
+  try {
+    const { task_id, user_id, completion_date, status, value, notes, link } = req.body;
+    await pool.query(`INSERT INTO task_completions (task_id,user_id,completion_date,status,value,notes,link) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (task_id,user_id,completion_date) DO UPDATE SET status=$4, value=$5, notes=$6, link=$7, updated_at=NOW()`,
+      [task_id, user_id, completion_date, status, value || 0, notes, link]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ POSTS ══
+app.get("/api/posts", async (req, res) => {
+  try { const { rows } = await pool.query("SELECT * FROM posts ORDER BY post_date DESC"); res.json(rows); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/posts", async (req, res) => {
+  try {
+    const { post_date, page, content_type, title, notes, hashtags, likes, comments, shares, impressions, post_link, added_by } = req.body;
+    const { rows } = await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,hashtags,likes,comments,shares,impressions,post_link,added_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *",
+      [post_date, page, content_type, title, notes, hashtags, likes||0, comments||0, shares||0, impressions||0, post_link, added_by]);
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete("/api/posts/:id", async (req, res) => {
+  try { await pool.query("DELETE FROM posts WHERE id=$1", [req.params.id]); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ PAGE METRICS ══
+app.get("/api/metrics", async (req, res) => {
+  try {
+    const { page } = req.query;
+    const q = page ? "SELECT * FROM page_metrics WHERE page=$1 ORDER BY metric_date DESC" : "SELECT * FROM page_metrics ORDER BY metric_date DESC";
+    const { rows } = page ? await pool.query(q, [page]) : await pool.query(q);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/metrics", async (req, res) => {
+  try {
+    const { metric_date, page, followers, new_followers, impressions, engagements, profile_views, post_reach, page_views, unique_visitors, clicks, source } = req.body;
+    const rate = impressions > 0 ? ((engagements / impressions) * 100).toFixed(2) : 0;
+    const { rows } = await pool.query("INSERT INTO page_metrics (metric_date,page,followers,new_followers,impressions,engagements,profile_views,post_reach,page_views,unique_visitors,clicks,engagement_rate,source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *",
+      [metric_date, page, followers||0, new_followers||0, impressions||0, engagements||0, profile_views||0, post_reach||0, page_views||0, unique_visitors||0, clicks||0, rate, source||"manual"]);
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ EMPLOYEES ══
+app.get("/api/employees", async (req, res) => {
+  try { const { rows } = await pool.query("SELECT * FROM employees ORDER BY name"); res.json(rows); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/employees", async (req, res) => {
+  try {
+    const { name, title, team, region, linkedin_url, photo_url } = req.body;
+    const { rows } = await pool.query("INSERT INTO employees (name,title,team,region,linkedin_url,photo_url) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *", [name, title, team, region, linkedin_url, photo_url]);
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put("/api/employees/:id", async (req, res) => {
+  try {
+    const { name, title, team, region, linkedin_url, photo_url } = req.body;
+    await pool.query("UPDATE employees SET name=$1,title=$2,team=$3,region=$4,linkedin_url=$5,photo_url=$6 WHERE id=$7", [name, title, team, region, linkedin_url, photo_url, req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete("/api/employees/:id", async (req, res) => {
+  try { await pool.query("DELETE FROM employees WHERE id=$1", [req.params.id]); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ ENGAGEMENT ══
+app.get("/api/engagement", async (req, res) => {
+  try { const { rows } = await pool.query("SELECT * FROM engagement ORDER BY date DESC"); res.json(rows); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/engagement", async (req, res) => {
+  try {
+    const { post_id, employee_id, type, date, note } = req.body;
+    const { rows } = await pool.query("INSERT INTO engagement (post_id,employee_id,type,date,note) VALUES ($1,$2,$3,$4,$5) RETURNING *", [post_id, employee_id, type, date, note]);
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete("/api/engagement/:id", async (req, res) => {
+  try { await pool.query("DELETE FROM engagement WHERE id=$1", [req.params.id]); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ LINKEDIN PROXY ══
 app.get("/api/linkedin/org/:orgId/dashboard", async (req, res) => {
   try {
     const token = getToken(req);
@@ -47,72 +232,55 @@ app.get("/api/linkedin/org/:orgId/dashboard", async (req, res) => {
     const { orgId } = req.params;
     const LI = "https://api.linkedin.com/v2";
     const urn = encodeURIComponent(`urn:li:organization:${orgId}`);
-
     const [networkSize, shareStats, pageStats] = await Promise.all([
       liFetch(`${LI}/networkSizes/${urn}?edgeType=CompanyFollowedByMember`, token),
       liFetch(`${LI}/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${urn}`, token),
       liFetch(`${LI}/organizationPageStatistics?q=organization&organization=${urn}`, token),
     ]);
-
     const totalFollowers = networkSize.data?.firstDegreeSize || 0;
     const sStats = (shareStats.data?.elements || [])[0]?.totalShareStatistics || {};
     let pageViews = 0, uniqueVisitors = 0;
-    (pageStats.data?.elements || []).forEach(el => {
-      if (el.totalPageStatistics) {
-        pageViews = el.totalPageStatistics.views?.allPageViews?.pageViews || 0;
-        uniqueVisitors = el.totalPageStatistics.views?.allPageViews?.uniquePageViews || 0;
-      }
-    });
+    (pageStats.data?.elements || []).forEach(el => { if (el.totalPageStatistics) { pageViews = el.totalPageStatistics.views?.allPageViews?.pageViews || 0; uniqueVisitors = el.totalPageStatistics.views?.allPageViews?.uniquePageViews || 0; } });
 
-    res.json({
-      orgId, timestamp: new Date().toISOString(), totalFollowers,
-      impressions: sStats.impressionCount || 0, clicks: sStats.clickCount || 0,
-      likes: sStats.likeCount || 0, comments: sStats.commentCount || 0,
-      shares: sStats.shareCount || 0, engagement: sStats.engagement || 0,
-      pageViews, uniqueVisitors,
-    });
+    const result = { orgId, timestamp: new Date().toISOString(), totalFollowers, impressions: sStats.impressionCount || 0, clicks: sStats.clickCount || 0, likes: sStats.likeCount || 0, comments: sStats.commentCount || 0, shares: sStats.shareCount || 0, engagement: sStats.engagement || 0, pageViews, uniqueVisitors };
+
+    // Auto-save to DB
+    try {
+      await pool.query("INSERT INTO page_metrics (metric_date,page,followers,impressions,engagements,page_views,unique_visitors,clicks,source) VALUES (CURRENT_DATE,'techwaukee',$1,$2,$3,$4,$5,$6,'api') ON CONFLICT DO NOTHING",
+        [totalFollowers, result.impressions, result.likes + result.comments + result.shares, pageViews, uniqueVisitors, result.clicks]);
+    } catch {}
+
+    res.json(result);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Post to LinkedIn (supports text, URL with article/image link)
 app.post("/api/linkedin/post", async (req, res) => {
   try {
     const token = getToken(req);
     if (!token) return res.status(401).json({ error: "Missing Bearer token" });
     const { orgId, text, url, imageUrl } = req.body;
     if (!orgId || !text) return res.status(400).json({ error: "Missing orgId or text" });
-
     const postBody = {
-      author: `urn:li:organization:${orgId}`,
-      commentary: text,
-      visibility: "PUBLIC",
+      author: `urn:li:organization:${orgId}`, commentary: text, visibility: "PUBLIC",
       distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
-      lifecycleState: "PUBLISHED",
-      isReshareDisabledByAuthor: false,
+      lifecycleState: "PUBLISHED", isReshareDisabledByAuthor: false,
     };
-
-    // If URL provided, add as article with optional thumbnail
-    if (url && url.trim()) {
-      postBody.content = {
-        article: {
-          source: url.trim(),
-          title: text.split("\n")[0].slice(0, 200) || "Shared link",
-          description: text.slice(0, 256),
-        },
-      };
-      // If image URL provided, use as thumbnail for the article
-      if (imageUrl && imageUrl.startsWith("http")) {
-        postBody.content.article.thumbnail = imageUrl;
-      }
+    if (url?.trim()) {
+      postBody.content = { article: { source: url.trim(), title: text.split("\n")[0].slice(0, 200), description: text.slice(0, 256) } };
+      if (imageUrl?.startsWith("http")) postBody.content.article.thumbnail = imageUrl;
     }
-
-    const result = await liFetch("https://api.linkedin.com/rest/posts", token, {
-      method: "POST",
-      body: postBody,
-    });
+    const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
     if (result.error) return res.status(result.status).json({ success: false, error: result.data?.message || "Failed", data: result.data });
+    // Save to DB
+    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,added_by) VALUES (CURRENT_DATE,'techwaukee','Text Post',$1,'Published via API','api')", [text.slice(0, 300)]); } catch {}
     res.json({ success: true, data: result.data });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+// ── Start ──
+initDB().then(() => {
+  app.listen(PORT, () => console.log(`Server running on port ${PORT} with PostgreSQL`));
+}).catch(err => {
+  console.error("DB init failed:", err.message);
+  app.listen(PORT, () => console.log(`Server running on port ${PORT} (DB offline)`));
+});
