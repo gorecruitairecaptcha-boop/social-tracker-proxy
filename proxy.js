@@ -277,9 +277,170 @@ app.post("/api/linkedin/post", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ══ SCHEDULED POSTS ══
+// Save a scheduled post
+app.post("/api/scheduled-posts", async (req, res) => {
+  try {
+    const { text, page, url, image_url, scheduled_at, org_id, access_token } = req.body;
+    if (!text || !scheduled_at || !org_id) return res.status(400).json({ error: "text, scheduled_at, and org_id required" });
+    await pool.query(`CREATE TABLE IF NOT EXISTS scheduled_posts (
+      id SERIAL PRIMARY KEY, text TEXT NOT NULL, page VARCHAR(20), url VARCHAR(500),
+      image_url TEXT, scheduled_at TIMESTAMP NOT NULL, org_id VARCHAR(50) NOT NULL,
+      access_token TEXT, status VARCHAR(20) DEFAULT 'pending', error TEXT,
+      published_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW()
+    )`);
+    const { rows } = await pool.query("INSERT INTO scheduled_posts (text,page,url,image_url,scheduled_at,org_id,access_token,status) VALUES ($1,$2,$3,$4,$5,$6,$7,'pending') RETURNING *",
+      [text, page, url, image_url, scheduled_at, org_id, access_token]);
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/scheduled-posts", async (req, res) => {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS scheduled_posts (
+      id SERIAL PRIMARY KEY, text TEXT, page VARCHAR(20), url VARCHAR(500),
+      image_url TEXT, scheduled_at TIMESTAMP, org_id VARCHAR(50),
+      access_token TEXT, status VARCHAR(20) DEFAULT 'pending', error TEXT,
+      published_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW()
+    )`);
+    const { rows } = await pool.query("SELECT id,text,page,url,scheduled_at,org_id,status,error,published_at,created_at FROM scheduled_posts ORDER BY scheduled_at ASC");
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/scheduled-posts/:id", async (req, res) => {
+  try { await pool.query("DELETE FROM scheduled_posts WHERE id=$1", [req.params.id]); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ LINKEDIN IMAGE UPLOAD ══
+// Step 1: Register image upload, Step 2: Upload binary, Step 3: Use asset in post
+app.post("/api/linkedin/upload-image", async (req, res) => {
+  try {
+    const token = getToken(req);
+    if (!token) return res.status(401).json({ error: "Missing Bearer token" });
+    const { orgId, imageBase64, mimeType } = req.body;
+    if (!orgId || !imageBase64) return res.status(400).json({ error: "orgId and imageBase64 required" });
+
+    // Step 1: Register upload
+    const registerBody = {
+      initializeUploadRequest: {
+        owner: `urn:li:organization:${orgId}`,
+      }
+    };
+    const regResult = await liFetch("https://api.linkedin.com/rest/images?action=initializeUpload", token, { method: "POST", body: registerBody });
+    if (regResult.error) return res.status(regResult.status).json({ error: "Failed to register image upload", data: regResult.data });
+
+    const uploadUrl = regResult.data?.value?.uploadUrl;
+    const imageUrn = regResult.data?.value?.image;
+    if (!uploadUrl || !imageUrn) return res.status(500).json({ error: "No upload URL returned from LinkedIn" });
+
+    // Step 2: Upload binary
+    const imageBuffer = Buffer.from(imageBase64, "base64");
+    const uploadRes = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": mimeType || "image/png",
+      },
+      body: imageBuffer,
+    });
+    if (!uploadRes.ok) return res.status(uploadRes.status).json({ error: `Image upload failed: ${uploadRes.status}` });
+
+    res.json({ success: true, imageUrn });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Post with uploaded image
+app.post("/api/linkedin/post-with-image", async (req, res) => {
+  try {
+    const token = getToken(req);
+    if (!token) return res.status(401).json({ error: "Missing Bearer token" });
+    const { orgId, text, imageUrn, url } = req.body;
+    if (!orgId || !text) return res.status(400).json({ error: "orgId and text required" });
+
+    const postBody = {
+      author: `urn:li:organization:${orgId}`,
+      commentary: text,
+      visibility: "PUBLIC",
+      distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: false,
+    };
+
+    if (imageUrn) {
+      // Post with image
+      postBody.content = { media: { id: imageUrn } };
+      // If URL provided, add as alt text link
+      if (url?.trim()) postBody.content.media.altText = `Click to visit: ${url}`;
+    } else if (url?.trim()) {
+      // Post with article link only
+      postBody.content = { article: { source: url.trim(), title: text.split("\n")[0].slice(0, 200), description: text.slice(0, 256) } };
+    }
+
+    const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
+    if (result.error) return res.status(result.status).json({ success: false, error: result.data?.message || "Failed", data: result.data });
+
+    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API','api')",
+      [orgId === "15078287" ? "techwaukee" : "gorecruitai", imageUrn ? "Image Post" : "Text Post", text.slice(0, 300)]); } catch {}
+
+    res.json({ success: true, data: result.data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ══ SCHEDULER: Auto-publish scheduled posts ══
+async function checkScheduledPosts() {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS scheduled_posts (
+      id SERIAL PRIMARY KEY, text TEXT, page VARCHAR(20), url VARCHAR(500),
+      image_url TEXT, scheduled_at TIMESTAMP, org_id VARCHAR(50),
+      access_token TEXT, status VARCHAR(20) DEFAULT 'pending', error TEXT,
+      published_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW()
+    )`);
+    const { rows } = await pool.query("SELECT * FROM scheduled_posts WHERE status='pending' AND scheduled_at <= NOW()");
+    for (const post of rows) {
+      try {
+        if (!post.access_token) { await pool.query("UPDATE scheduled_posts SET status='failed', error='No access token' WHERE id=$1", [post.id]); continue; }
+
+        const postBody = {
+          author: `urn:li:organization:${post.org_id}`,
+          commentary: post.text,
+          visibility: "PUBLIC",
+          distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
+          lifecycleState: "PUBLISHED",
+          isReshareDisabledByAuthor: false,
+        };
+        if (post.url?.trim()) {
+          postBody.content = { article: { source: post.url, title: post.text.split("\n")[0].slice(0, 200), description: post.text.slice(0, 256) } };
+        }
+
+        const result = await liFetch("https://api.linkedin.com/rest/posts", post.access_token, { method: "POST", body: postBody });
+        if (result.error) {
+          await pool.query("UPDATE scheduled_posts SET status='failed', error=$1 WHERE id=$2", [result.data?.message || `HTTP ${result.status}`, post.id]);
+          console.log(`[SCHEDULER] Failed post ${post.id}: ${result.data?.message}`);
+        } else {
+          await pool.query("UPDATE scheduled_posts SET status='published', published_at=NOW() WHERE id=$1", [post.id]);
+          await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,added_by) VALUES (CURRENT_DATE,$1,'Scheduled Post',$2,'Auto-published by scheduler','scheduler')",
+            [post.page || "techwaukee", post.text.slice(0, 300)]);
+          console.log(`[SCHEDULER] Published post ${post.id}`);
+        }
+      } catch (e) {
+        await pool.query("UPDATE scheduled_posts SET status='failed', error=$1 WHERE id=$2", [e.message, post.id]);
+      }
+    }
+    if (rows.length > 0) console.log(`[SCHEDULER] Processed ${rows.length} scheduled posts`);
+  } catch (e) { console.error("[SCHEDULER] Error:", e.message); }
+}
+
 // ── Start ──
 initDB().then(() => {
-  app.listen(PORT, () => console.log(`Server running on port ${PORT} with PostgreSQL`));
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT} with PostgreSQL`);
+    // Check scheduled posts every 60 seconds
+    setInterval(checkScheduledPosts, 60 * 1000);
+    checkScheduledPosts(); // Run once on startup
+    console.log("[SCHEDULER] Running every 60 seconds");
+  });
 }).catch(err => {
   console.error("DB init failed:", err.message);
   app.listen(PORT, () => console.log(`Server running on port ${PORT} (DB offline)`));
