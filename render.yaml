@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: social-tracker-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node proxy.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20
