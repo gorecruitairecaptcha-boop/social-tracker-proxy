@@ -74,23 +74,41 @@ app.get("/api/linkedin/org/:orgId/dashboard", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Post to LinkedIn
+// Post to LinkedIn (supports text, URL with article/image link)
 app.post("/api/linkedin/post", async (req, res) => {
   try {
     const token = getToken(req);
     if (!token) return res.status(401).json({ error: "Missing Bearer token" });
-    const { orgId, text } = req.body;
+    const { orgId, text, url, imageUrl } = req.body;
     if (!orgId || !text) return res.status(400).json({ error: "Missing orgId or text" });
+
+    const postBody = {
+      author: `urn:li:organization:${orgId}`,
+      commentary: text,
+      visibility: "PUBLIC",
+      distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: false,
+    };
+
+    // If URL provided, add as article with optional thumbnail
+    if (url && url.trim()) {
+      postBody.content = {
+        article: {
+          source: url.trim(),
+          title: text.split("\n")[0].slice(0, 200) || "Shared link",
+          description: text.slice(0, 256),
+        },
+      };
+      // If image URL provided, use as thumbnail for the article
+      if (imageUrl && imageUrl.startsWith("http")) {
+        postBody.content.article.thumbnail = imageUrl;
+      }
+    }
+
     const result = await liFetch("https://api.linkedin.com/rest/posts", token, {
       method: "POST",
-      body: {
-        author: `urn:li:organization:${orgId}`,
-        commentary: text,
-        visibility: "PUBLIC",
-        distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
-        lifecycleState: "PUBLISHED",
-        isReshareDisabledByAuthor: false,
-      },
+      body: postBody,
     });
     if (result.error) return res.status(result.status).json({ success: false, error: result.data?.message || "Failed", data: result.data });
     res.json({ success: true, data: result.data });
