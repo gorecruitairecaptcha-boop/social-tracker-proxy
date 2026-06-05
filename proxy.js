@@ -261,67 +261,69 @@ app.get("/api/linkedin/org/:orgId/dashboard", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ══ SHARE PAGES — OG meta tag pages for LinkedIn full-width cards ══
-const PROXY_BASE = process.env.RENDER_EXTERNAL_URL || process.env.PROXY_BASE_URL || "https://social-tracker-proxy.onrender.com";
+// ══ SHARE PAGES — Upload to GoDaddy (always online) for LinkedIn cards ══
+import { Client as FTPClient } from "basic-ftp";
+const GODADDY_BASE = "http://appone.gorecruitai.com";
+const FTP_CONFIG = { host: "50.63.8.208", user: "appone", password: "57kkT0r&4", port: 21, secure: false };
 
-// Create a share page (uploads image + creates OG redirect page)
+async function uploadToGoDaddy(filename, content) {
+  const ftp = new FTPClient();
+  try {
+    await ftp.access(FTP_CONFIG);
+    await ftp.ensureDir("/shares/");
+    const { Readable } = await import("stream");
+    const stream = Readable.from(typeof content === "string" ? Buffer.from(content) : content);
+    await ftp.uploadFrom(stream, `/shares/${filename}`);
+    return `${GODADDY_BASE}/shares/${filename}`;
+  } finally { ftp.close(); }
+}
+
+// Create a share page (uploads image + OG page to GoDaddy)
 app.post("/api/share", async (req, res) => {
   try {
     const { title, description, destination_url, image_base64, image_mime } = req.body;
     if (!destination_url) return res.status(400).json({ error: "destination_url required" });
     const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    await pool.query("INSERT INTO share_pages (id, title, description, destination_url, image_data, image_mime) VALUES ($1,$2,$3,$4,$5,$6)",
-      [id, title || "", description || "", destination_url, image_base64 || null, image_mime || "image/png"]);
-    const shareUrl = `${PROXY_BASE}/s/${id}`;
-    const imageUrl = image_base64 ? `${PROXY_BASE}/img/${id}` : null;
-    res.json({ success: true, shareUrl, imageUrl, id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
 
-// Serve the hosted image
-app.get("/img/:id", async (req, res) => {
-  try {
-    const { rows } = await pool.query("SELECT image_data, image_mime FROM share_pages WHERE id = $1", [req.params.id]);
-    if (rows.length === 0 || !rows[0].image_data) return res.status(404).send("Not found");
-    const buffer = Buffer.from(rows[0].image_data, "base64");
-    res.set("Content-Type", rows[0].image_mime || "image/png");
-    res.set("Cache-Control", "public, max-age=31536000");
-    res.send(buffer);
-  } catch (e) { res.status(500).send("Error"); }
-});
+    let imgUrl = "https://techwaukee.com/images/logo.png";
 
-// Serve the OG meta tag page — LinkedIn scrapes this
-app.get("/s/:id", async (req, res) => {
-  try {
-    const { rows } = await pool.query("SELECT * FROM share_pages WHERE id = $1", [req.params.id]);
-    if (rows.length === 0) return res.status(404).send("Not found");
-    const p = rows[0];
-    const imgUrl = p.image_data ? `${PROXY_BASE}/img/${p.id}` : "https://techwaukee.com/images/logo.png";
-    const ua = (req.headers["user-agent"] || "").toLowerCase();
-    const isBot = ua.includes("linkedin") || ua.includes("bot") || ua.includes("crawler") || ua.includes("spider") || ua.includes("facebookexternalhit");
-
-    if (!isBot) {
-      // Real user clicking → redirect to destination
-      return res.redirect(302, p.destination_url);
+    // Upload image to GoDaddy if provided
+    if (image_base64) {
+      try {
+        const imgBuffer = Buffer.from(image_base64, "base64");
+        const ext = (image_mime || "image/png").includes("jpeg") ? "jpg" : "png";
+        imgUrl = await uploadToGoDaddy(`${id}.${ext}`, imgBuffer);
+        console.log(`[SHARE] Image uploaded: ${imgUrl}`);
+      } catch (e) { console.log("[SHARE] Image upload failed:", e.message); }
     }
 
-    // LinkedIn bot → serve OG meta page
-    res.set("Content-Type", "text/html");
-    res.send(`<!DOCTYPE html><html><head>
-      <meta charset="utf-8" />
-      <meta property="og:type" content="website" />
-      <meta property="og:title" content="${(p.title || "").replace(/"/g, "&quot;")}" />
-      <meta property="og:description" content="${(p.description || "").replace(/"/g, "&quot;")}" />
-      <meta property="og:image" content="${imgUrl}" />
-      <meta property="og:image:width" content="1200" />
-      <meta property="og:image:height" content="627" />
-      <meta property="og:url" content="${PROXY_BASE}/s/${p.id}" />
-      <meta name="twitter:card" content="summary_large_image" />
-      <meta name="twitter:image" content="${imgUrl}" />
-      <title>${(p.title || "Techwaukee").replace(/</g, "&lt;")}</title>
-      <meta http-equiv="refresh" content="0;url=${p.destination_url}" />
-    </head><body><p>Redirecting to <a href="${p.destination_url}">${p.destination_url}</a>...</p></body></html>`);
-  } catch (e) { res.status(500).send("Error"); }
+    // Create OG redirect HTML page on GoDaddy
+    const safeTitle = (title || "Techwaukee").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    const safeDesc = (description || "").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    const html = `<!DOCTYPE html><html><head>
+<meta charset="utf-8"/>
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="${safeTitle}"/>
+<meta property="og:description" content="${safeDesc}"/>
+<meta property="og:image" content="${imgUrl}"/>
+<meta property="og:image:width" content="1200"/>
+<meta property="og:image:height" content="627"/>
+<meta property="og:url" content="${GODADDY_BASE}/shares/${id}.html"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:image" content="${imgUrl}"/>
+<title>${safeTitle}</title>
+<meta http-equiv="refresh" content="0;url=${destination_url}"/>
+</head><body><p>Redirecting...</p></body></html>`;
+
+    try {
+      const shareUrl = await uploadToGoDaddy(`${id}.html`, html);
+      console.log(`[SHARE] Page uploaded: ${shareUrl}`);
+      res.json({ success: true, shareUrl, imageUrl: imgUrl, id });
+    } catch (e) {
+      console.log("[SHARE] Page upload failed:", e.message);
+      res.json({ success: true, shareUrl: destination_url, imageUrl: imgUrl, id });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══ SHARED LINKEDIN SETTINGS (stored in DB for all users) ══
