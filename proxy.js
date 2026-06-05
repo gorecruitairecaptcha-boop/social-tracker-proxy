@@ -227,8 +227,8 @@ app.delete("/api/engagement/:id", async (req, res) => {
 // ══ LINKEDIN PROXY ══
 app.get("/api/linkedin/org/:orgId/dashboard", async (req, res) => {
   try {
-    const token = getToken(req);
-    if (!token) return res.status(401).json({ error: "Missing Bearer token" });
+    const token = await getTokenOrDB(req);
+    if (!token) return res.status(401).json({ error: "LinkedIn token not configured. Ask admin to set it in Settings." });
     const { orgId } = req.params;
     const LI = "https://api.linkedin.com/v2";
     const urn = encodeURIComponent(`urn:li:organization:${orgId}`);
@@ -254,10 +254,43 @@ app.get("/api/linkedin/org/:orgId/dashboard", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ══ SHARED LINKEDIN SETTINGS (stored in DB for all users) ══
+app.get("/api/linkedin-settings", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT config_key, config_value FROM api_config WHERE config_key IN ('linkedin_access_token','proxy_url','techwaukee_org_id','gorecruitai_org_id','linkedin_client_id')");
+    const config = {};
+    rows.forEach(r => { config[r.config_key] = r.config_value; });
+    // Don't expose full token to client — just indicate if set
+    if (config.linkedin_access_token) config.has_token = true;
+    res.json(config);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/linkedin-settings", async (req, res) => {
+  try {
+    const entries = Object.entries(req.body);
+    for (const [key, value] of entries) {
+      await pool.query(`INSERT INTO api_config (config_key, config_value) VALUES ($1, $2)
+        ON CONFLICT (config_key) DO UPDATE SET config_value = $2, updated_at = NOW()`, [key, value || ""]);
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Helper: get token from request header OR from database
+async function getTokenOrDB(req) {
+  const headerToken = getToken(req);
+  if (headerToken) return headerToken;
+  try {
+    const { rows } = await pool.query("SELECT config_value FROM api_config WHERE config_key = 'linkedin_access_token'");
+    return rows[0]?.config_value || null;
+  } catch { return null; }
+}
+
 app.post("/api/linkedin/post", async (req, res) => {
   try {
-    const token = getToken(req);
-    if (!token) return res.status(401).json({ error: "Missing Bearer token" });
+    const token = await getTokenOrDB(req);
+    if (!token) return res.status(401).json({ error: "LinkedIn token not configured. Ask admin to set it in Settings." });
     const { orgId, text, url, imageUrl } = req.body;
     if (!orgId || !text) return res.status(400).json({ error: "Missing orgId or text" });
     const postBody = {
