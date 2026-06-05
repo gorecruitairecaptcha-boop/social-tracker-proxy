@@ -573,9 +573,19 @@ async function checkScheduledPosts() {
       published_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW()
     )`);
     const { rows } = await pool.query("SELECT * FROM scheduled_posts WHERE status='pending' AND scheduled_at <= NOW()");
+    if (rows.length === 0) return;
+
+    // Get shared token from DB
+    let sharedToken = null;
+    try {
+      const tokenRes = await pool.query("SELECT config_value FROM api_config WHERE config_key = 'linkedin_access_token'");
+      sharedToken = tokenRes.rows[0]?.config_value || null;
+    } catch {}
+
     for (const post of rows) {
       try {
-        if (!post.access_token) { await pool.query("UPDATE scheduled_posts SET status='failed', error='No access token' WHERE id=$1", [post.id]); continue; }
+        const token = post.access_token || sharedToken;
+        if (!token) { await pool.query("UPDATE scheduled_posts SET status='failed', error='No access token configured. Ask admin to set it in Settings.' WHERE id=$1", [post.id]); continue; }
 
         const postBody = {
           author: `urn:li:organization:${post.org_id}`,
@@ -589,7 +599,7 @@ async function checkScheduledPosts() {
           postBody.content = { article: { source: post.url, title: post.text.split("\n")[0].slice(0, 200), description: post.text.slice(0, 256) } };
         }
 
-        const result = await liFetch("https://api.linkedin.com/rest/posts", post.access_token, { method: "POST", body: postBody });
+        const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
         if (result.error) {
           await pool.query("UPDATE scheduled_posts SET status='failed', error=$1 WHERE id=$2", [result.data?.message || `HTTP ${result.status}`, post.id]);
           console.log(`[SCHEDULER] Failed post ${post.id}: ${result.data?.message}`);
@@ -603,7 +613,7 @@ async function checkScheduledPosts() {
         await pool.query("UPDATE scheduled_posts SET status='failed', error=$1 WHERE id=$2", [e.message, post.id]);
       }
     }
-    if (rows.length > 0) console.log(`[SCHEDULER] Processed ${rows.length} scheduled posts`);
+    console.log(`[SCHEDULER] Processed ${rows.length} scheduled posts`);
   } catch (e) { console.error("[SCHEDULER] Error:", e.message); }
 }
 
