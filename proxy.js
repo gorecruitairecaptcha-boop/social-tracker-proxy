@@ -261,51 +261,78 @@ app.get("/api/linkedin/org/:orgId/dashboard", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ══ SHARE PAGES — OG pages hosted on Render (with keep-alive) ══
+// ══ SHARE PAGES — Upload images to imgbb (always fast), OG pages on Render ══
 const PROXY_BASE = process.env.RENDER_EXTERNAL_URL || "https://social-tracker-proxy.onrender.com";
+const IMGBB_KEY = process.env.IMGBB_KEY || ""; // Set in Render env vars
 
 // Keep-alive: ping self every 14 min so Render doesn't sleep
 setInterval(() => { fetch(`${PROXY_BASE}/api/health`).catch(() => {}); }, 14 * 60 * 1000);
 
+// Upload image to imgbb (free, fast CDN, permanent URLs)
+async function uploadToImgBB(base64Data) {
+  if (!IMGBB_KEY) return null;
+  try {
+    const form = new URLSearchParams();
+    form.append("key", IMGBB_KEY);
+    form.append("image", base64Data);
+    const res = await fetch("https://api.imgbb.com/1/upload", { method: "POST", body: form });
+    const data = await res.json();
+    if (data.success) return data.data.url; // Returns permanent CDN URL
+  } catch (e) { console.log("[IMGBB] Upload failed:", e.message); }
+  return null;
+}
+
 // Create a share page
 app.post("/api/share", async (req, res) => {
   try {
-    const { title, description, destination_url, image_base64, image_mime } = req.body;
+    const { title, description, destination_url, image_base64 } = req.body;
     if (!destination_url) return res.status(400).json({ error: "destination_url required" });
     const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    await pool.query(`CREATE TABLE IF NOT EXISTS share_pages (id VARCHAR(20) PRIMARY KEY, title VARCHAR(300), description VARCHAR(500), destination_url VARCHAR(500) NOT NULL, image_data TEXT, image_mime VARCHAR(50) DEFAULT 'image/png', created_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query("INSERT INTO share_pages (id, title, description, destination_url, image_data, image_mime) VALUES ($1,$2,$3,$4,$5,$6)",
-      [id, title || "", description || "", destination_url, image_base64 || null, image_mime || "image/png"]);
+
+    // Upload image to imgbb CDN (fast, always online)
+    let imgUrl = "";
+    if (image_base64) {
+      const clean = image_base64.includes(",") ? image_base64.split(",")[1] : image_base64;
+      imgUrl = await uploadToImgBB(clean) || "";
+      if (imgUrl) console.log(`[SHARE] Image on imgbb: ${imgUrl}`);
+      else console.log("[SHARE] imgbb upload failed, falling back to Render hosting");
+    }
+
+    // If imgbb failed, store in DB as fallback
+    await pool.query(`CREATE TABLE IF NOT EXISTS share_pages (id VARCHAR(20) PRIMARY KEY, title VARCHAR(300), description VARCHAR(500), destination_url VARCHAR(500) NOT NULL, image_url VARCHAR(500), image_data TEXT, created_at TIMESTAMP DEFAULT NOW())`);
+    await pool.query("INSERT INTO share_pages (id, title, description, destination_url, image_url, image_data) VALUES ($1,$2,$3,$4,$5,$6)",
+      [id, title || "", description || "", destination_url, imgUrl || null, (!imgUrl && image_base64) ? image_base64 : null]);
+
     const shareUrl = `${PROXY_BASE}/s/${id}`;
-    const imageUrl = image_base64 ? `${PROXY_BASE}/img/${id}` : null;
-    console.log(`[SHARE] Created: ${shareUrl}`);
-    res.json({ success: true, shareUrl, imageUrl, id });
+    console.log(`[SHARE] Page: ${shareUrl}`);
+    res.json({ success: true, shareUrl, imageUrl: imgUrl, id });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Serve hosted image (from DB)
+// Serve hosted image fallback (from DB, if imgbb failed)
 app.get("/img/:id", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT image_data, image_mime FROM share_pages WHERE id = $1", [req.params.id]);
+    const { rows } = await pool.query("SELECT image_data FROM share_pages WHERE id = $1", [req.params.id]);
     if (rows.length === 0 || !rows[0].image_data) return res.status(404).send("Not found");
-    const buffer = Buffer.from(rows[0].image_data, "base64");
-    res.set("Content-Type", rows[0].image_mime || "image/png");
+    const raw = rows[0].image_data;
+    const base64 = raw.includes(",") ? raw.split(",")[1] : raw;
+    res.set("Content-Type", "image/png");
     res.set("Cache-Control", "public, max-age=31536000");
-    res.send(buffer);
+    res.send(Buffer.from(base64, "base64"));
   } catch (e) { res.status(500).send("Error"); }
 });
 
-// OG meta page — LinkedIn bot scrapes this, users get redirected
+// OG meta page — LinkedIn bot scrapes this
 app.get("/s/:id", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM share_pages WHERE id = $1", [req.params.id]);
     if (rows.length === 0) return res.status(404).send("Not found");
     const p = rows[0];
-    const imgUrl = p.image_data ? `${PROXY_BASE}/img/${p.id}` : "";
+    // Use imgbb URL if available, otherwise fall back to Render-hosted image
+    const imgUrl = p.image_url || (p.image_data ? `${PROXY_BASE}/img/${p.id}` : "");
     const safeTitle = (p.title || "Techwaukee").replace(/"/g, "&quot;").replace(/</g, "&lt;");
     const safeDesc = (p.description || "").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 
-    // Serve OG page to ALL visitors (bot and human) — redirect via JavaScript after meta tags load
     res.set("Content-Type", "text/html");
     res.send(`<!DOCTYPE html><html><head>
 <meta charset="utf-8"/>
@@ -488,6 +515,49 @@ app.post("/api/linkedin/post-with-image", async (req, res) => {
 
     try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API','api')",
       [orgId === "15078287" ? "techwaukee" : "gorecruitai", imageUrn ? "Image Post" : "Text Post", text.slice(0, 300)]); } catch {}
+
+    res.json({ success: true, data: result.data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Post as Link Card (article with thumbnail hosted on LinkedIn CDN)
+app.post("/api/linkedin/post-link-card", async (req, res) => {
+  try {
+    const token = await getTokenOrDB(req);
+    if (!token) return res.status(401).json({ error: "Token not configured" });
+    const { orgId, text, shareUrl, imageUrn } = req.body;
+    if (!orgId || !text) return res.status(400).json({ error: "orgId and text required" });
+
+    const postBody = {
+      author: `urn:li:organization:${orgId}`,
+      commentary: text,
+      visibility: "PUBLIC",
+      distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: false,
+      content: {
+        article: {
+          source: shareUrl || "https://techwaukee.com",
+          title: text.split("\n")[0].slice(0, 200) || "Techwaukee",
+          description: text.slice(0, 256),
+        }
+      }
+    };
+
+    // If image was uploaded to LinkedIn, use it as thumbnail
+    if (imageUrn) {
+      postBody.content.article.thumbnail = imageUrn;
+    }
+
+    console.log(`[LINK-CARD] Posting with article source: ${shareUrl}, thumbnail: ${imageUrn || "none"}`);
+    const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
+    if (result.error) {
+      console.log("[LINK-CARD] Error:", JSON.stringify(result.data));
+      return res.status(result.status).json({ success: false, error: result.data?.message || "Failed", data: result.data });
+    }
+
+    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,post_link,added_by) VALUES (CURRENT_DATE,$1,'Link Card',$2,$3,$4,'api')",
+      [orgId === "15078287" ? "techwaukee" : "gorecruitai", text.slice(0, 300), "Published as link card via API", shareUrl || ""]); } catch {}
 
     res.json({ success: true, data: result.data });
   } catch (err) { res.status(500).json({ error: err.message }); }
