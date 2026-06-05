@@ -28,6 +28,7 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS employees (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, title VARCHAR(100), team VARCHAR(50), region VARCHAR(20) DEFAULT 'India', linkedin_url VARCHAR(300), photo_url VARCHAR(300), created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS engagement (id SERIAL PRIMARY KEY, post_id VARCHAR(50) NOT NULL, employee_id VARCHAR(50) NOT NULL, type VARCHAR(20) NOT NULL, date DATE NOT NULL, note TEXT, created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS api_config (id SERIAL PRIMARY KEY, config_key VARCHAR(50) UNIQUE NOT NULL, config_value TEXT, updated_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS share_pages (id VARCHAR(20) PRIMARY KEY, title VARCHAR(300), description VARCHAR(500), destination_url VARCHAR(500) NOT NULL, image_data TEXT, image_mime VARCHAR(50) DEFAULT 'image/png', created_at TIMESTAMP DEFAULT NOW());
     `);
     // Seed default admin if empty
     const { rows } = await client.query("SELECT COUNT(*) as c FROM users");
@@ -53,7 +54,7 @@ async function initDB() {
 }
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" })); // Allow larger payloads for image upload
 
 // ── Helper: LinkedIn fetch ──
 async function liFetch(url, token, options = {}) {
@@ -254,6 +255,69 @@ app.get("/api/linkedin/org/:orgId/dashboard", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ══ SHARE PAGES — OG meta tag pages for LinkedIn full-width cards ══
+const PROXY_BASE = process.env.RENDER_EXTERNAL_URL || process.env.PROXY_BASE_URL || "https://social-tracker-proxy.onrender.com";
+
+// Create a share page (uploads image + creates OG redirect page)
+app.post("/api/share", async (req, res) => {
+  try {
+    const { title, description, destination_url, image_base64, image_mime } = req.body;
+    if (!destination_url) return res.status(400).json({ error: "destination_url required" });
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    await pool.query("INSERT INTO share_pages (id, title, description, destination_url, image_data, image_mime) VALUES ($1,$2,$3,$4,$5,$6)",
+      [id, title || "", description || "", destination_url, image_base64 || null, image_mime || "image/png"]);
+    const shareUrl = `${PROXY_BASE}/s/${id}`;
+    const imageUrl = image_base64 ? `${PROXY_BASE}/img/${id}` : null;
+    res.json({ success: true, shareUrl, imageUrl, id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Serve the hosted image
+app.get("/img/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT image_data, image_mime FROM share_pages WHERE id = $1", [req.params.id]);
+    if (rows.length === 0 || !rows[0].image_data) return res.status(404).send("Not found");
+    const buffer = Buffer.from(rows[0].image_data, "base64");
+    res.set("Content-Type", rows[0].image_mime || "image/png");
+    res.set("Cache-Control", "public, max-age=31536000");
+    res.send(buffer);
+  } catch (e) { res.status(500).send("Error"); }
+});
+
+// Serve the OG meta tag page — LinkedIn scrapes this
+app.get("/s/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM share_pages WHERE id = $1", [req.params.id]);
+    if (rows.length === 0) return res.status(404).send("Not found");
+    const p = rows[0];
+    const imgUrl = p.image_data ? `${PROXY_BASE}/img/${p.id}` : "https://techwaukee.com/images/logo.png";
+    const ua = (req.headers["user-agent"] || "").toLowerCase();
+    const isBot = ua.includes("linkedin") || ua.includes("bot") || ua.includes("crawler") || ua.includes("spider") || ua.includes("facebookexternalhit");
+
+    if (!isBot) {
+      // Real user clicking → redirect to destination
+      return res.redirect(302, p.destination_url);
+    }
+
+    // LinkedIn bot → serve OG meta page
+    res.set("Content-Type", "text/html");
+    res.send(`<!DOCTYPE html><html><head>
+      <meta charset="utf-8" />
+      <meta property="og:type" content="website" />
+      <meta property="og:title" content="${(p.title || "").replace(/"/g, "&quot;")}" />
+      <meta property="og:description" content="${(p.description || "").replace(/"/g, "&quot;")}" />
+      <meta property="og:image" content="${imgUrl}" />
+      <meta property="og:image:width" content="1200" />
+      <meta property="og:image:height" content="627" />
+      <meta property="og:url" content="${PROXY_BASE}/s/${p.id}" />
+      <meta name="twitter:card" content="summary_large_image" />
+      <meta name="twitter:image" content="${imgUrl}" />
+      <title>${(p.title || "Techwaukee").replace(/</g, "&lt;")}</title>
+      <meta http-equiv="refresh" content="0;url=${p.destination_url}" />
+    </head><body><p>Redirecting to <a href="${p.destination_url}">${p.destination_url}</a>...</p></body></html>`);
+  } catch (e) { res.status(500).send("Error"); }
+});
+
 // ══ SHARED LINKEDIN SETTINGS (stored in DB for all users) ══
 app.get("/api/linkedin-settings", async (req, res) => {
   try {
@@ -350,7 +414,7 @@ app.delete("/api/scheduled-posts/:id", async (req, res) => {
 // Step 1: Register image upload, Step 2: Upload binary, Step 3: Use asset in post
 app.post("/api/linkedin/upload-image", async (req, res) => {
   try {
-    const token = getToken(req);
+    const token = await getTokenOrDB(req);
     if (!token) return res.status(401).json({ error: "Missing Bearer token" });
     const { orgId, imageBase64, mimeType } = req.body;
     if (!orgId || !imageBase64) return res.status(400).json({ error: "orgId and imageBase64 required" });
@@ -387,7 +451,7 @@ app.post("/api/linkedin/upload-image", async (req, res) => {
 // Post with uploaded image
 app.post("/api/linkedin/post-with-image", async (req, res) => {
   try {
-    const token = getToken(req);
+    const token = await getTokenOrDB(req);
     if (!token) return res.status(401).json({ error: "Missing Bearer token" });
     const { orgId, text, imageUrn, url } = req.body;
     if (!orgId || !text) return res.status(400).json({ error: "orgId and text required" });
