@@ -46,8 +46,14 @@ async function initDB() {
         ('John', 'Recruiter', 'US Staffing', 'USA', 'https://linkedin.com/in/john'),
         ('Rajesh Kumar', 'Senior Recruiter', 'India', 'India', 'https://linkedin.com/in/rajesh-kumar'),
         ('Mike Chen', 'Senior Recruiter', 'US Staffing', 'USA', 'https://linkedin.com/in/mike-chen')`);
-      await client.query(`INSERT INTO api_config (config_key, config_value) VALUES ('techwaukee_org_id', '15078287'), ('linkedin_client_id', '86rz73bd1rfacx')`);
+      await client.query(`INSERT INTO api_config (config_key, config_value) VALUES ('techwaukee_org_id', '15078287'), ('linkedin_client_id', '86rz73bd1rfacx'), ('linkedin_access_token', 'AQWI45juh_wEPuBSx24Hv6jzdiQ80uHaEn7vv6LqKgDGvhR_jWaceDbxAsOiR3bvw3ewmJ258CuMIn7px4oj4KIfCy0JWbK54AQVLJH2LIJvDPnEujYY8USUBA43FpY1G3BsaOmFXwZa84LSeYU6jD03W5LwagxZp6pIhvWB9RyQ8D6eHsrGoQLnumvgGfAjVDOqyMnvZkEhLwdJIx1CTSWCkALhT9Txyok8m6RlSq3ZT4VSLxcVOWJvDJFvwdg_o1ctv2HbGNAYikcw4a3-yd4HYu9j2Dsb1GerRokSmdQZYsJ1EVZHyofh5k7N78OLoiGtTAKullkJVpkO3Etpx-JZPTtpsw')`);
       console.log("[DB] Seeded default data");
+    }
+    // Ensure token is in DB
+    const tokenCheck = await client.query("SELECT config_value FROM api_config WHERE config_key = 'linkedin_access_token'");
+    if (tokenCheck.rows.length === 0 || !tokenCheck.rows[0].config_value) {
+      await client.query(`INSERT INTO api_config (config_key, config_value) VALUES ('linkedin_access_token', 'AQWI45juh_wEPuBSx24Hv6jzdiQ80uHaEn7vv6LqKgDGvhR_jWaceDbxAsOiR3bvw3ewmJ258CuMIn7px4oj4KIfCy0JWbK54AQVLJH2LIJvDPnEujYY8USUBA43FpY1G3BsaOmFXwZa84LSeYU6jD03W5LwagxZp6pIhvWB9RyQ8D6eHsrGoQLnumvgGfAjVDOqyMnvZkEhLwdJIx1CTSWCkALhT9Txyok8m6RlSq3ZT4VSLxcVOWJvDJFvwdg_o1ctv2HbGNAYikcw4a3-yd4HYu9j2Dsb1GerRokSmdQZYsJ1EVZHyofh5k7N78OLoiGtTAKullkJVpkO3Etpx-JZPTtpsw') ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value`);
+      console.log("[DB] Access token saved");
     }
     console.log("[DB] Tables ready");
   } finally { client.release(); }
