@@ -572,7 +572,7 @@ async function checkScheduledPosts() {
       access_token TEXT, status VARCHAR(20) DEFAULT 'pending', error TEXT,
       published_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW()
     )`);
-    const { rows } = await pool.query("SELECT * FROM scheduled_posts WHERE status='pending' AND scheduled_at <= NOW()");
+    const { rows } = await pool.query("SELECT * FROM scheduled_posts WHERE status='pending' AND scheduled_at <= (NOW() AT TIME ZONE 'Asia/Kolkata')");
     if (rows.length === 0) return;
 
     // Get shared token from DB
