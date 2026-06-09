@@ -411,13 +411,14 @@ app.post("/api/linkedin/post", async (req, res) => {
     if (!token) return res.status(401).json({ error: "LinkedIn token not configured. Ask admin to set it in Settings." });
     const { orgId, text, url, imageUrl } = req.body;
     if (!orgId || !text) return res.status(400).json({ error: "Missing orgId or text" });
+    console.log(`[POST] commentary length: ${text.length}, first 80: "${text.slice(0, 80)}"`);
     const postBody = {
       author: `urn:li:organization:${orgId}`, commentary: text, visibility: "PUBLIC",
       distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
       lifecycleState: "PUBLISHED", isReshareDisabledByAuthor: false,
     };
     if (url?.trim()) {
-      postBody.content = { article: { source: url.trim(), title: text.split("\n")[0].slice(0, 200), description: text.slice(0, 256) } };
+      postBody.content = { article: { source: url.trim(), title: text.split("\n")[0].slice(0, 200) } };
       if (imageUrl?.startsWith("http")) postBody.content.article.thumbnail = imageUrl;
     }
     const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
@@ -427,7 +428,7 @@ app.post("/api/linkedin/post", async (req, res) => {
     const pageName = orgId === "15078287" ? "techwaukee" : "gorecruitai";
     try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API',$4,$5,$6,'api')",
       [pageName, url ? "Article" : "Text Post", text.slice(0, 300), text, liLink, liUrn]); } catch {}
-    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn });
+    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn, textLength: text.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -512,6 +513,7 @@ app.post("/api/linkedin/post-with-image", async (req, res) => {
     if (!token) return res.status(401).json({ error: "Missing Bearer token" });
     const { orgId, text, imageUrn, url } = req.body;
     if (!orgId || !text) return res.status(400).json({ error: "orgId and text required" });
+    console.log(`[POST-IMAGE] commentary length: ${text.length}, first 80: "${text.slice(0, 80)}"`);
 
     const postBody = {
       author: `urn:li:organization:${orgId}`,
@@ -523,13 +525,10 @@ app.post("/api/linkedin/post-with-image", async (req, res) => {
     };
 
     if (imageUrn) {
-      // Post with image
       postBody.content = { media: { id: imageUrn } };
-      // If URL provided, add as alt text link
       if (url?.trim()) postBody.content.media.altText = `Click to visit: ${url}`;
     } else if (url?.trim()) {
-      // Post with article link only
-      postBody.content = { article: { source: url.trim(), title: text.split("\n")[0].slice(0, 200), description: text.slice(0, 256) } };
+      postBody.content = { article: { source: url.trim(), title: text.split("\n")[0].slice(0, 200) } };
     }
 
     const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
@@ -541,7 +540,7 @@ app.post("/api/linkedin/post-with-image", async (req, res) => {
     try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API',$4,$5,$6,'api')",
       [pageName, imageUrn ? "Image Post" : "Text Post", text.slice(0, 300), text, liLink, liUrn]); } catch {}
 
-    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn });
+    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn, textLength: text.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -552,6 +551,7 @@ app.post("/api/linkedin/post-link-card", async (req, res) => {
     if (!token) return res.status(401).json({ error: "Token not configured" });
     const { orgId, text, shareUrl, imageUrn } = req.body;
     if (!orgId || !text) return res.status(400).json({ error: "orgId and text required" });
+    console.log(`[LINK-CARD] commentary length: ${text.length}, first 80: "${text.slice(0, 80)}"`);
 
     const postBody = {
       author: `urn:li:organization:${orgId}`,
@@ -564,17 +564,15 @@ app.post("/api/linkedin/post-link-card", async (req, res) => {
         article: {
           source: shareUrl || "https://techwaukee.com",
           title: text.split("\n")[0].slice(0, 200) || "Techwaukee",
-          description: text.slice(0, 256),
         }
       }
     };
 
-    // If image was uploaded to LinkedIn, use it as thumbnail
     if (imageUrn) {
       postBody.content.article.thumbnail = imageUrn;
     }
 
-    console.log(`[LINK-CARD] Posting with article source: ${shareUrl}, thumbnail: ${imageUrn || "none"}`);
+    console.log(`[LINK-CARD] Posting with article source: ${shareUrl}, thumbnail: ${imageUrn || "none"}, full commentary: ${text.length} chars`);
     const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
     if (result.error) {
       console.log("[LINK-CARD] Error:", JSON.stringify(result.data));
@@ -587,7 +585,8 @@ app.post("/api/linkedin/post-link-card", async (req, res) => {
     try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,'Link Card',$2,'Published as link card via API',$3,$4,$5,'api')",
       [pageName, text.slice(0, 300), text, liLink || shareUrl || "", liUrn]); } catch {}
 
-    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn });
+    console.log(`[LINK-CARD] Success! URN: ${liUrn}, commentary sent: ${text.length} chars`);
+    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn, textLength: text.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -614,6 +613,26 @@ async function checkScheduledPosts() {
       try {
         const token = post.access_token || sharedToken;
         if (!token) { await pool.query("UPDATE scheduled_posts SET status='failed', error='No access token configured. Ask admin to set it in Settings.' WHERE id=$1", [post.id]); continue; }
+        console.log(`[SCHEDULER] Processing post ${post.id}, text length: ${post.text?.length}, has image: ${!!post.image_url}, has url: ${!!post.url}`);
+
+        // If post has a base64 image, upload it to LinkedIn first
+        let uploadedImageUrn = null;
+        if (post.image_url && post.image_url.startsWith("data:")) {
+          try {
+            const base64 = post.image_url.split(",")[1] || post.image_url;
+            const mimeMatch = post.image_url.match(/data:([^;]+);/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "image/png";
+            const registerBody = { initializeUploadRequest: { owner: `urn:li:organization:${post.org_id}` } };
+            const regResult = await liFetch("https://api.linkedin.com/rest/images?action=initializeUpload", token, { method: "POST", body: registerBody });
+            if (!regResult.error && regResult.data?.value?.uploadUrl) {
+              const uploadUrl = regResult.data.value.uploadUrl;
+              uploadedImageUrn = regResult.data.value.image;
+              const imageBuffer = Buffer.from(base64, "base64");
+              await fetch(uploadUrl, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": mimeType }, body: imageBuffer });
+              console.log(`[SCHEDULER] Image uploaded for post ${post.id}: ${uploadedImageUrn}`);
+            }
+          } catch (imgErr) { console.log(`[SCHEDULER] Image upload failed for post ${post.id}: ${imgErr.message}`); }
+        }
 
         const postBody = {
           author: `urn:li:organization:${post.org_id}`,
@@ -623,10 +642,19 @@ async function checkScheduledPosts() {
           lifecycleState: "PUBLISHED",
           isReshareDisabledByAuthor: false,
         };
-        if (post.url?.trim()) {
-          postBody.content = { article: { source: post.url, title: post.text.split("\n")[0].slice(0, 200), description: post.text.slice(0, 256) } };
+
+        if (uploadedImageUrn && post.url?.trim()) {
+          // Image + URL = link card with thumbnail
+          postBody.content = { article: { source: post.url, title: post.text.split("\n")[0].slice(0, 200), thumbnail: uploadedImageUrn } };
+        } else if (uploadedImageUrn) {
+          // Image only = image post
+          postBody.content = { media: { id: uploadedImageUrn } };
+        } else if (post.url?.trim()) {
+          // URL only = link card without thumbnail
+          postBody.content = { article: { source: post.url, title: post.text.split("\n")[0].slice(0, 200) } };
         }
 
+        console.log(`[SCHEDULER] Sending to LinkedIn - commentary: ${post.text?.length} chars, content type: ${postBody.content ? Object.keys(postBody.content)[0] : "text-only"}`);
         const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
         if (result.error) {
           await pool.query("UPDATE scheduled_posts SET status='failed', error=$1 WHERE id=$2", [result.data?.message || `HTTP ${result.status}`, post.id]);
@@ -635,9 +663,10 @@ async function checkScheduledPosts() {
           const liUrn = result.postUrn || null;
           const liLink = liUrn ? `https://www.linkedin.com/feed/update/${liUrn}` : "";
           await pool.query("UPDATE scheduled_posts SET status='published', published_at=NOW() WHERE id=$1", [post.id]);
-          await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,'Scheduled Post',$2,'Auto-published by scheduler',$3,$4,$5,'scheduler')",
-            [post.page || "techwaukee", post.text.slice(0, 300), post.text, liLink, liUrn]);
-          console.log(`[SCHEDULER] Published post ${post.id}, URN: ${liUrn}`);
+          const contentType = uploadedImageUrn ? (post.url ? "Link Card" : "Image Post") : (post.url ? "Link Card" : "Scheduled Post");
+          await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Auto-published by scheduler',$4,$5,$6,'scheduler')",
+            [post.page || "techwaukee", contentType, post.text.slice(0, 300), post.text, liLink, liUrn]);
+          console.log(`[SCHEDULER] Published post ${post.id}, URN: ${liUrn}, text sent: ${post.text?.length} chars`);
         }
       } catch (e) {
         await pool.query("UPDATE scheduled_posts SET status='failed', error=$1 WHERE id=$2", [e.message, post.id]);
