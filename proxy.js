@@ -55,6 +55,10 @@ async function initDB() {
       await client.query(`INSERT INTO api_config (config_key, config_value) VALUES ('linkedin_access_token', 'AQWI45juh_wEPuBSx24Hv6jzdiQ80uHaEn7vv6LqKgDGvhR_jWaceDbxAsOiR3bvw3ewmJ258CuMIn7px4oj4KIfCy0JWbK54AQVLJH2LIJvDPnEujYY8USUBA43FpY1G3BsaOmFXwZa84LSeYU6jD03W5LwagxZp6pIhvWB9RyQ8D6eHsrGoQLnumvgGfAjVDOqyMnvZkEhLwdJIx1CTSWCkALhT9Txyok8m6RlSq3ZT4VSLxcVOWJvDJFvwdg_o1ctv2HbGNAYikcw4a3-yd4HYu9j2Dsb1GerRokSmdQZYsJ1EVZHyofh5k7N78OLoiGtTAKullkJVpkO3Etpx-JZPTtpsw') ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value`);
       console.log("[DB] Access token saved");
     }
+    // Migrate: add full_text and image_url columns to posts if missing
+    try { await client.query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS full_text TEXT"); } catch {}
+    try { await client.query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS image_url TEXT"); } catch {}
+    try { await client.query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS linkedin_urn VARCHAR(200)"); } catch {}
     console.log("[DB] Tables ready");
   } finally { client.release(); }
 }
@@ -71,7 +75,8 @@ async function liFetch(url, token, options = {}) {
   });
   const text = await res.text();
   let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
-  return { error: !res.ok, status: res.status, data };
+  const postUrn = res.headers.get("x-restli-id") || res.headers.get("x-linkedin-id") || null;
+  return { error: !res.ok, status: res.status, data, postUrn };
 }
 
 function getToken(req) { const a = req.headers.authorization; return a?.startsWith("Bearer ") ? a.slice(7) : null; }
@@ -164,6 +169,20 @@ app.post("/api/posts", async (req, res) => {
     const { rows } = await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,hashtags,likes,comments,shares,impressions,post_link,added_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *",
       [post_date, page, content_type, title, notes, hashtags, likes||0, comments||0, shares||0, impressions||0, post_link, added_by]);
     res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put("/api/posts/:id", async (req, res) => {
+  try {
+    const { post_link, linkedin_urn, full_text, image_url } = req.body;
+    const sets = []; const vals = []; let idx = 1;
+    if (post_link !== undefined) { sets.push(`post_link=$${idx++}`); vals.push(post_link); }
+    if (linkedin_urn !== undefined) { sets.push(`linkedin_urn=$${idx++}`); vals.push(linkedin_urn); }
+    if (full_text !== undefined) { sets.push(`full_text=$${idx++}`); vals.push(full_text); }
+    if (image_url !== undefined) { sets.push(`image_url=$${idx++}`); vals.push(image_url); }
+    if (sets.length === 0) return res.json({ success: true });
+    vals.push(req.params.id);
+    await pool.query(`UPDATE posts SET ${sets.join(",")} WHERE id=$${idx}`, vals);
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.delete("/api/posts/:id", async (req, res) => {
@@ -403,9 +422,12 @@ app.post("/api/linkedin/post", async (req, res) => {
     }
     const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
     if (result.error) return res.status(result.status).json({ success: false, error: result.data?.message || "Failed", data: result.data });
-    // Save to DB
-    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,added_by) VALUES (CURRENT_DATE,'techwaukee','Text Post',$1,'Published via API','api')", [text.slice(0, 300)]); } catch {}
-    res.json({ success: true, data: result.data });
+    const liUrn = result.postUrn || null;
+    const liLink = liUrn ? `https://www.linkedin.com/feed/update/${liUrn}` : "";
+    const pageName = orgId === "15078287" ? "techwaukee" : "gorecruitai";
+    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API',$4,$5,$6,'api')",
+      [pageName, url ? "Article" : "Text Post", text.slice(0, 300), text, liLink, liUrn]); } catch {}
+    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -513,10 +535,13 @@ app.post("/api/linkedin/post-with-image", async (req, res) => {
     const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
     if (result.error) return res.status(result.status).json({ success: false, error: result.data?.message || "Failed", data: result.data });
 
-    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API','api')",
-      [orgId === "15078287" ? "techwaukee" : "gorecruitai", imageUrn ? "Image Post" : "Text Post", text.slice(0, 300)]); } catch {}
+    const liUrn = result.postUrn || null;
+    const liLink = liUrn ? `https://www.linkedin.com/feed/update/${liUrn}` : "";
+    const pageName = orgId === "15078287" ? "techwaukee" : "gorecruitai";
+    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API',$4,$5,$6,'api')",
+      [pageName, imageUrn ? "Image Post" : "Text Post", text.slice(0, 300), text, liLink, liUrn]); } catch {}
 
-    res.json({ success: true, data: result.data });
+    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -556,10 +581,13 @@ app.post("/api/linkedin/post-link-card", async (req, res) => {
       return res.status(result.status).json({ success: false, error: result.data?.message || "Failed", data: result.data });
     }
 
-    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,post_link,added_by) VALUES (CURRENT_DATE,$1,'Link Card',$2,$3,$4,'api')",
-      [orgId === "15078287" ? "techwaukee" : "gorecruitai", text.slice(0, 300), "Published as link card via API", shareUrl || ""]); } catch {}
+    const liUrn = result.postUrn || null;
+    const liLink = liUrn ? `https://www.linkedin.com/feed/update/${liUrn}` : "";
+    const pageName = orgId === "15078287" ? "techwaukee" : "gorecruitai";
+    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,'Link Card',$2,'Published as link card via API',$3,$4,$5,'api')",
+      [pageName, text.slice(0, 300), text, liLink || shareUrl || "", liUrn]); } catch {}
 
-    res.json({ success: true, data: result.data });
+    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -604,10 +632,12 @@ async function checkScheduledPosts() {
           await pool.query("UPDATE scheduled_posts SET status='failed', error=$1 WHERE id=$2", [result.data?.message || `HTTP ${result.status}`, post.id]);
           console.log(`[SCHEDULER] Failed post ${post.id}: ${result.data?.message}`);
         } else {
+          const liUrn = result.postUrn || null;
+          const liLink = liUrn ? `https://www.linkedin.com/feed/update/${liUrn}` : "";
           await pool.query("UPDATE scheduled_posts SET status='published', published_at=NOW() WHERE id=$1", [post.id]);
-          await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,added_by) VALUES (CURRENT_DATE,$1,'Scheduled Post',$2,'Auto-published by scheduler','scheduler')",
-            [post.page || "techwaukee", post.text.slice(0, 300)]);
-          console.log(`[SCHEDULER] Published post ${post.id}`);
+          await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,'Scheduled Post',$2,'Auto-published by scheduler',$3,$4,$5,'scheduler')",
+            [post.page || "techwaukee", post.text.slice(0, 300), post.text, liLink, liUrn]);
+          console.log(`[SCHEDULER] Published post ${post.id}, URN: ${liUrn}`);
         }
       } catch (e) {
         await pool.query("UPDATE scheduled_posts SET status='failed', error=$1 WHERE id=$2", [e.message, post.id]);
