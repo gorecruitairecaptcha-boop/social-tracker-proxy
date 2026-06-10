@@ -415,22 +415,19 @@ app.post("/api/linkedin/post", async (req, res) => {
     const { orgId, text, url, imageUrl } = req.body;
     if (!orgId || !text) return res.status(400).json({ error: "Missing orgId or text" });
     console.log(`[POST] commentary length: ${text.length}, first 80: "${text.slice(0, 80)}"`);
+    // NEVER create article/link card content — LinkedIn hides commentary text on org pages when link cards are present
     const postBody = {
       author: `urn:li:organization:${orgId}`, commentary: text, visibility: "PUBLIC",
       distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
       lifecycleState: "PUBLISHED", isReshareDisabledByAuthor: false,
     };
-    if (url?.trim()) {
-      postBody.content = { article: { source: url.trim(), title: text.split("\n")[0].slice(0, 200) } };
-      if (imageUrl?.startsWith("http")) postBody.content.article.thumbnail = imageUrl;
-    }
     const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
     if (result.error) return res.status(result.status).json({ success: false, error: result.data?.message || "Failed", data: result.data });
     const liUrn = result.postUrn || null;
     const liLink = liUrn ? `https://www.linkedin.com/feed/update/${liUrn}` : "";
     const pageName = orgId === "15078287" ? "techwaukee" : "gorecruitai";
     try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API',$4,$5,$6,'api')",
-      [pageName, url ? "Article" : "Text Post", text.slice(0, 300), text, liLink, liUrn]); } catch {}
+      [pageName, "Text Post", text.slice(0, 300), text, liLink, liUrn]); } catch {}
     res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn, textLength: text.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -597,6 +594,11 @@ app.post("/api/linkedin/post-link-card", async (req, res) => {
     if (!orgId || !text) return res.status(400).json({ error: "orgId and text required" });
     console.log(`[LINK-CARD] commentary length: ${text.length}, first 80: "${text.slice(0, 80)}"`);
 
+    // Split text: first line = title, rest = description for the article card
+    const lines = text.split("\n");
+    const articleTitle = (lines[0] || "Techwaukee").slice(0, 200);
+    const articleDesc = text.slice(0, 2000); // LinkedIn article description max ~2000
+
     const postBody = {
       author: `urn:li:organization:${orgId}`,
       commentary: text,
@@ -607,7 +609,8 @@ app.post("/api/linkedin/post-link-card", async (req, res) => {
       content: {
         article: {
           source: shareUrl || "https://techwaukee.com",
-          title: text.split("\n")[0].slice(0, 200) || "Techwaukee",
+          title: articleTitle,
+          description: articleDesc,
         }
       }
     };
@@ -615,6 +618,8 @@ app.post("/api/linkedin/post-link-card", async (req, res) => {
     if (imageUrn) {
       postBody.content.article.thumbnail = imageUrn;
     }
+
+    console.log(`[LINK-CARD] Article title: "${articleTitle}", description: ${articleDesc.length} chars`);
 
     console.log(`[LINK-CARD] Posting with article source: ${shareUrl}, thumbnail: ${imageUrn || "none"}, full commentary: ${text.length} chars`);
     const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
