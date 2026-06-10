@@ -23,13 +23,16 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, email VARCHAR(150) UNIQUE NOT NULL, password VARCHAR(255) NOT NULL, role VARCHAR(20) DEFAULT 'member', region VARCHAR(20) DEFAULT 'India', is_active BOOLEAN DEFAULT true, created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, title VARCHAR(300) NOT NULL, description TEXT, category VARCHAR(50), region VARCHAR(20) DEFAULT 'all', page VARCHAR(20) DEFAULT 'both', priority VARCHAR(10) DEFAULT 'medium', target_value INT DEFAULT 1, due_date DATE, recurring BOOLEAN DEFAULT false, recurrence VARCHAR(20) DEFAULT 'daily', status VARCHAR(20) DEFAULT 'pending', assigned_to VARCHAR(50), assigned_by VARCHAR(50), created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS task_completions (id SERIAL PRIMARY KEY, task_id INT REFERENCES tasks(id) ON DELETE CASCADE, user_id INT REFERENCES users(id) ON DELETE CASCADE, completion_date DATE NOT NULL, status VARCHAR(20) DEFAULT 'pending', value INT DEFAULT 0, notes TEXT, link VARCHAR(500), updated_at TIMESTAMP DEFAULT NOW(), UNIQUE(task_id, user_id, completion_date));
-      CREATE TABLE IF NOT EXISTS posts (id SERIAL PRIMARY KEY, post_date DATE NOT NULL, page VARCHAR(20) NOT NULL, content_type VARCHAR(50), title VARCHAR(300), notes TEXT, hashtags VARCHAR(500), likes INT DEFAULT 0, comments INT DEFAULT 0, shares INT DEFAULT 0, impressions INT DEFAULT 0, post_link VARCHAR(500), added_by VARCHAR(50), last_synced_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS posts (id SERIAL PRIMARY KEY, post_date DATE NOT NULL, page VARCHAR(20) NOT NULL, content_type VARCHAR(50), title VARCHAR(300), notes TEXT, full_text TEXT, hashtags VARCHAR(500), likes INT DEFAULT 0, comments INT DEFAULT 0, shares INT DEFAULT 0, impressions INT DEFAULT 0, post_link VARCHAR(500), linkedin_urn VARCHAR(300), added_by VARCHAR(50), last_synced_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS page_metrics (id SERIAL PRIMARY KEY, metric_date DATE NOT NULL, page VARCHAR(20) NOT NULL, followers INT DEFAULT 0, new_followers INT DEFAULT 0, impressions INT DEFAULT 0, engagements INT DEFAULT 0, profile_views INT DEFAULT 0, post_reach INT DEFAULT 0, page_views INT DEFAULT 0, unique_visitors INT DEFAULT 0, clicks INT DEFAULT 0, engagement_rate DECIMAL(5,2) DEFAULT 0, source VARCHAR(20) DEFAULT 'manual', created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS employees (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, title VARCHAR(100), team VARCHAR(50), region VARCHAR(20) DEFAULT 'India', linkedin_url VARCHAR(300), photo_url VARCHAR(300), created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS engagement (id SERIAL PRIMARY KEY, post_id VARCHAR(50) NOT NULL, employee_id VARCHAR(50) NOT NULL, type VARCHAR(20) NOT NULL, date DATE NOT NULL, note TEXT, created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS api_config (id SERIAL PRIMARY KEY, config_key VARCHAR(50) UNIQUE NOT NULL, config_value TEXT, updated_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS share_pages (id VARCHAR(20) PRIMARY KEY, title VARCHAR(300), description VARCHAR(500), destination_url VARCHAR(500) NOT NULL, image_data TEXT, image_mime VARCHAR(50) DEFAULT 'image/png', created_at TIMESTAMP DEFAULT NOW());
     `);
+    // Migrate: add columns that may be missing on existing DBs
+    try { await client.query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS full_text TEXT"); } catch {}
+    try { await client.query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS linkedin_urn VARCHAR(300)"); } catch {}
     // Seed default admin if empty
     const { rows } = await client.query("SELECT COUNT(*) as c FROM users");
     if (parseInt(rows[0].c) === 0) {
@@ -165,9 +168,9 @@ app.get("/api/posts", async (req, res) => {
 });
 app.post("/api/posts", async (req, res) => {
   try {
-    const { post_date, page, content_type, title, notes, hashtags, likes, comments, shares, impressions, post_link, added_by } = req.body;
-    const { rows } = await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,hashtags,likes,comments,shares,impressions,post_link,added_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *",
-      [post_date, page, content_type, title, notes, hashtags, likes||0, comments||0, shares||0, impressions||0, post_link, added_by]);
+    const { post_date, page, content_type, title, notes, full_text, hashtags, likes, comments, shares, impressions, post_link, linkedin_urn, added_by } = req.body;
+    const { rows } = await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,hashtags,likes,comments,shares,impressions,post_link,linkedin_urn,added_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *",
+      [post_date, page, content_type, title, notes, full_text, hashtags, likes||0, comments||0, shares||0, impressions||0, post_link, linkedin_urn, added_by]);
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -542,6 +545,47 @@ app.post("/api/linkedin/post-with-image", async (req, res) => {
 
     res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn, textLength: text.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ══ SYNC: Fetch post engagement stats from LinkedIn ══
+app.get("/api/linkedin/post-stats/:urn", async (req, res) => {
+  try {
+    const token = await getTokenOrDB(req);
+    if (!token) return res.status(401).json({ error: "Token not configured" });
+    const { urn } = req.params;
+    const decoded = decodeURIComponent(urn);
+    console.log(`[SYNC] Fetching stats for: ${decoded}`);
+
+    // Try REST API first (newer), fall back to v2
+    let result = await liFetch(`https://api.linkedin.com/rest/socialMetadata/${encodeURIComponent(decoded)}`, token);
+    if (result.error) {
+      // Fallback: v2 socialActions
+      result = await liFetch(`https://api.linkedin.com/v2/socialActions/${encodeURIComponent(decoded)}`, token);
+    }
+
+    if (result.error) {
+      console.log(`[SYNC] Error fetching stats:`, JSON.stringify(result.data));
+      return res.status(result.status).json({ error: result.data?.message || "Failed to fetch stats", data: result.data });
+    }
+
+    const d = result.data;
+    const stats = {
+      likeCount: d.likesSummary?.totalLikes ?? d.likes?.length ?? d.numLikes ?? 0,
+      commentCount: d.commentsSummary?.aggregatedTotalComments ?? d.comments?.length ?? d.numComments ?? 0,
+      shareCount: d.sharesSummary?.totalShares ?? d.numShares ?? 0,
+    };
+    console.log(`[SYNC] Stats for ${decoded}: likes=${stats.likeCount}, comments=${stats.commentCount}, shares=${stats.shareCount}`);
+
+    // Also update DB
+    try {
+      await pool.query("UPDATE posts SET likes=$1, comments=$2, shares=$3, last_synced_at=NOW() WHERE linkedin_urn=$4", [stats.likeCount, stats.commentCount, stats.shareCount, decoded]);
+    } catch {}
+
+    res.json(stats);
+  } catch (err) {
+    console.log(`[SYNC] Error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Post as Link Card (article with thumbnail hosted on LinkedIn CDN)
