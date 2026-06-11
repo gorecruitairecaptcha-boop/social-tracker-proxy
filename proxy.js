@@ -524,11 +524,10 @@ app.post("/api/linkedin/post-with-image", async (req, res) => {
       isReshareDisabledByAuthor: false,
     };
 
+    // NEVER create article/link card content — LinkedIn hides commentary text on org pages when link cards are present
     if (imageUrn) {
       postBody.content = { media: { id: imageUrn } };
       if (url?.trim()) postBody.content.media.altText = `Click to visit: ${url}`;
-    } else if (url?.trim()) {
-      postBody.content = { article: { source: url.trim(), title: text.split("\n")[0].slice(0, 200) } };
     }
 
     const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
@@ -585,60 +584,6 @@ app.get("/api/linkedin/post-stats/:urn", async (req, res) => {
   }
 });
 
-// Post as Link Card (article with thumbnail hosted on LinkedIn CDN)
-app.post("/api/linkedin/post-link-card", async (req, res) => {
-  try {
-    const token = await getTokenOrDB(req);
-    if (!token) return res.status(401).json({ error: "Token not configured" });
-    const { orgId, text, shareUrl, imageUrn } = req.body;
-    if (!orgId || !text) return res.status(400).json({ error: "orgId and text required" });
-    console.log(`[LINK-CARD] commentary length: ${text.length}, first 80: "${text.slice(0, 80)}"`);
-
-    // Split text: first line = title, rest = description for the article card
-    const lines = text.split("\n");
-    const articleTitle = (lines[0] || "Techwaukee").slice(0, 200);
-    const articleDesc = text.slice(0, 2000); // LinkedIn article description max ~2000
-
-    const postBody = {
-      author: `urn:li:organization:${orgId}`,
-      commentary: text,
-      visibility: "PUBLIC",
-      distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
-      lifecycleState: "PUBLISHED",
-      isReshareDisabledByAuthor: false,
-      content: {
-        article: {
-          source: shareUrl || "https://techwaukee.com",
-          title: articleTitle,
-          description: articleDesc,
-        }
-      }
-    };
-
-    if (imageUrn) {
-      postBody.content.article.thumbnail = imageUrn;
-    }
-
-    console.log(`[LINK-CARD] Article title: "${articleTitle}", description: ${articleDesc.length} chars`);
-
-    console.log(`[LINK-CARD] Posting with article source: ${shareUrl}, thumbnail: ${imageUrn || "none"}, full commentary: ${text.length} chars`);
-    const result = await liFetch("https://api.linkedin.com/rest/posts", token, { method: "POST", body: postBody });
-    if (result.error) {
-      console.log("[LINK-CARD] Error:", JSON.stringify(result.data));
-      return res.status(result.status).json({ success: false, error: result.data?.message || "Failed", data: result.data });
-    }
-
-    const liUrn = result.postUrn || null;
-    const liLink = liUrn ? `https://www.linkedin.com/feed/update/${liUrn}` : "";
-    const pageName = orgId === "15078287" ? "techwaukee" : "gorecruitai";
-    try { await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,'Link Card',$2,'Published as link card via API',$3,$4,$5,'api')",
-      [pageName, text.slice(0, 300), text, liLink || shareUrl || "", liUrn]); } catch {}
-
-    console.log(`[LINK-CARD] Success! URN: ${liUrn}, commentary sent: ${text.length} chars`);
-    res.json({ success: true, data: result.data, linkedinUrl: liLink, linkedinUrn: liUrn, textLength: text.length });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 // ══ SCHEDULER: Auto-publish scheduled posts ══
 async function checkScheduledPosts() {
   try {
@@ -692,15 +637,11 @@ async function checkScheduledPosts() {
           isReshareDisabledByAuthor: false,
         };
 
-        if (uploadedImageUrn && post.url?.trim()) {
-          // Image + URL = link card with thumbnail
-          postBody.content = { article: { source: post.url, title: post.text.split("\n")[0].slice(0, 200), thumbnail: uploadedImageUrn } };
-        } else if (uploadedImageUrn) {
-          // Image only = image post
+        // NEVER create article/link card content — LinkedIn hides commentary text on org pages when link cards are present.
+        // Image = image post; otherwise plain text post (URL stays in commentary text if the user included it).
+        if (uploadedImageUrn) {
           postBody.content = { media: { id: uploadedImageUrn } };
-        } else if (post.url?.trim()) {
-          // URL only = link card without thumbnail
-          postBody.content = { article: { source: post.url, title: post.text.split("\n")[0].slice(0, 200) } };
+          if (post.url?.trim()) postBody.content.media.altText = `Click to visit: ${post.url}`;
         }
 
         console.log(`[SCHEDULER] Sending to LinkedIn - commentary: ${post.text?.length} chars, content type: ${postBody.content ? Object.keys(postBody.content)[0] : "text-only"}`);
@@ -712,7 +653,7 @@ async function checkScheduledPosts() {
           const liUrn = result.postUrn || null;
           const liLink = liUrn ? `https://www.linkedin.com/feed/update/${liUrn}` : "";
           await pool.query("UPDATE scheduled_posts SET status='published', published_at=NOW() WHERE id=$1", [post.id]);
-          const contentType = uploadedImageUrn ? (post.url ? "Link Card" : "Image Post") : (post.url ? "Link Card" : "Scheduled Post");
+          const contentType = uploadedImageUrn ? "Image Post" : "Scheduled Post";
           await pool.query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Auto-published by scheduler',$4,$5,$6,'scheduler')",
             [post.page || "techwaukee", contentType, post.text.slice(0, 300), post.text, liLink, liUrn]);
           console.log(`[SCHEDULER] Published post ${post.id}, URN: ${liUrn}, text sent: ${post.text?.length} chars`);
