@@ -1,9 +1,10 @@
 {
   "name": "social-tracker-proxy",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
-    "start": "node proxy.js"
+    "start": "node proxy.js",
+    "vercel-dev": "vercel dev"
   },
   "dependencies": {
     "express": "^4.18.2",

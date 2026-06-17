@@ -84,22 +84,11 @@ async function liFetch(url, token, options = {}) {
 
 function getToken(req) { const a = req.headers.authorization; return a?.startsWith("Bearer ") ? a.slice(7) : null; }
 
-// ── Helper: Escape LinkedIn "Little Text Format" reserved characters ──
-// LinkedIn's Posts API treats \ | { } @ [ ] ( ) < > * _ ~ as formatting chars.
-// Unescaped, they silently SWALLOW all text after them (e.g. "(Full Stack)" cut posts at the paren).
-// We escape everything except # so hashtags stay clickable.
-function escapeLittleText(text) {
-  if (!text) return text;
-  return text.replace(/([\\|{}@\[\]()<>*_~])/g, "\\$1");
-}
-
-const PROXY_VERSION = "2026-06-11-escape-fix";
-
 // ══ Health ══
 app.get("/", (req, res) => res.json({ status: "ok", server: "Social Tracker API" }));
 app.get("/api/health", async (req, res) => {
-  try { await pool.query("SELECT 1"); res.json({ status: "ok", db: "connected", version: PROXY_VERSION }); }
-  catch (e) { res.json({ status: "ok", db: "error", error: e.message, version: PROXY_VERSION }); }
+  try { await pool.query("SELECT 1"); res.json({ status: "ok", db: "connected" }); }
+  catch (e) { res.json({ status: "ok", db: "error", error: e.message }); }
 });
 
 // ══ AUTH ══
@@ -428,7 +417,7 @@ app.post("/api/linkedin/post", async (req, res) => {
     console.log(`[POST] commentary length: ${text.length}, first 80: "${text.slice(0, 80)}"`);
     // NEVER create article/link card content — LinkedIn hides commentary text on org pages when link cards are present
     const postBody = {
-      author: `urn:li:organization:${orgId}`, commentary: escapeLittleText(text), visibility: "PUBLIC",
+      author: `urn:li:organization:${orgId}`, commentary: text, visibility: "PUBLIC",
       distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
       lifecycleState: "PUBLISHED", isReshareDisabledByAuthor: false,
     };
@@ -528,7 +517,7 @@ app.post("/api/linkedin/post-with-image", async (req, res) => {
 
     const postBody = {
       author: `urn:li:organization:${orgId}`,
-      commentary: escapeLittleText(text),
+      commentary: text,
       visibility: "PUBLIC",
       distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
       lifecycleState: "PUBLISHED",
@@ -641,7 +630,7 @@ async function checkScheduledPosts() {
 
         const postBody = {
           author: `urn:li:organization:${post.org_id}`,
-          commentary: escapeLittleText(post.text),
+          commentary: post.text,
           visibility: "PUBLIC",
           distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
           lifecycleState: "PUBLISHED",

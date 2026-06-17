@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "buildCommand": "",
+  "outputDirectory": "",
+  "framework": null,
+  "functions": {
+    "api/**/*.js": {
+      "maxDuration": 30
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/check-scheduled",
+      "schedule": "* * * * *"
+    }
+  ],
+  "rewrites": [
+    { "source": "/s/:id", "destination": "/api/s/:id" },
+    { "source": "/img/:id", "destination": "/api/img/:id" }
+  ]
+}
