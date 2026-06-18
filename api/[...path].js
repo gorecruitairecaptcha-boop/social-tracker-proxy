@@ -365,6 +365,112 @@ CREATE TABLE IF NOT EXISTS scheduled_posts (id SERIAL PRIMARY KEY,text TEXT NOT 
       return res.json({success:true,imported:results});
     }
 
+    // ---- AI Generate ----
+    if (route === "ai/generate") {
+      if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+      const { topic, tone, type, brandVoice } = req.body;
+      if (!topic) return res.status(400).json({ error: "topic is required" });
+      const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+      if (!DEEPSEEK_API_KEY) return res.status(500).json({ error: "DEEPSEEK_API_KEY not configured" });
+      const systemPrompt = `You are a LinkedIn content expert. Write a compelling LinkedIn post about the given topic. Include relevant emojis, hashtags, and maintain a professional tone. The post should be engaging, encourage interaction, and be optimized for LinkedIn's algorithm. Keep it concise but impactful.${brandVoice ? `\n\nBrand voice guidelines: ${brandVoice}` : ""}`;
+      const userPrompt = `Write a LinkedIn post about: ${topic}${tone ? `\nTone: ${tone}` : ""}${type ? `\nPost type: ${type}` : ""}`;
+      try {
+        const aiRes = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` }, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }], temperature: 0.7 }) });
+        const aiData = await aiRes.json();
+        if (!aiRes.ok) return res.status(aiRes.status).json({ error: "DeepSeek API error", details: aiData });
+        return res.json({ success: true, text: aiData.choices?.[0]?.message?.content || "", usage: aiData.usage });
+      } catch (e) { return res.status(500).json({ error: "AI generation failed", message: e.message }); }
+    }
+
+    // ---- AI Best Time ----
+    if (route === "ai/best-time") {
+      if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+      const { orgId } = req.body;
+      const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+      if (!DEEPSEEK_API_KEY) return res.status(500).json({ error: "DEEPSEEK_API_KEY not configured" });
+      try {
+        const { rows } = await query("SELECT post_date, likes, comments, shares, impressions FROM posts WHERE (likes+comments+shares) > 0 ORDER BY post_date DESC LIMIT 100");
+        if (rows.length < 5) return res.json({ success: true, source: "heuristic", recommendations: [{ day: "Tuesday", time: "09:00", reason: "Generally high engagement for B2B" }, { day: "Wednesday", time: "10:00", reason: "Mid-week peak activity" }, { day: "Thursday", time: "08:30", reason: "Strong morning engagement" }] });
+        const postData = rows.map(r => ({ date: r.post_date, day: new Date(r.post_date).toLocaleDateString("en-US", { weekday: "long" }), engagement: (r.likes || 0) + (r.comments || 0) + (r.shares || 0), impressions: r.impressions || 0 }));
+        const aiRes = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` }, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "system", content: "You are a LinkedIn analytics expert. Analyze posting patterns and engagement data to recommend the best times to post. Return a JSON object with a 'recommendations' array, each item having 'day', 'time' (HH:MM format), and 'reason' fields. Return ONLY valid JSON, no markdown." }, { role: "user", content: `Analyze this posting data and recommend the top 3 best times to post on LinkedIn:\n${JSON.stringify(postData)}${orgId ? `\nOrg ID: ${orgId}` : ""}` }], temperature: 0.5 }) });
+        const aiData = await aiRes.json();
+        if (!aiRes.ok) return res.status(aiRes.status).json({ error: "DeepSeek API error", details: aiData });
+        const content = aiData.choices?.[0]?.message?.content || "{}";
+        try { const parsed = JSON.parse(content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim()); return res.json({ success: true, source: "ai", postsAnalyzed: rows.length, ...parsed }); } catch { return res.json({ success: true, source: "ai", raw: content, postsAnalyzed: rows.length }); }
+      } catch (e) { return res.status(500).json({ error: "Best time analysis failed", message: e.message }); }
+    }
+
+    // ---- AI Sentiment ----
+    if (route === "ai/sentiment") {
+      if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+      const { postIds } = req.body;
+      if (!postIds || !Array.isArray(postIds) || postIds.length === 0) return res.status(400).json({ error: "postIds array is required" });
+      const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+      if (!DEEPSEEK_API_KEY) return res.status(500).json({ error: "DEEPSEEK_API_KEY not configured" });
+      try {
+        const placeholders = postIds.map((_, i) => `$${i + 1}`).join(",");
+        const { rows } = await query(`SELECT id, title, full_text, likes, comments, shares, impressions FROM posts WHERE id IN (${placeholders})`, postIds);
+        if (rows.length === 0) return res.status(404).json({ error: "No posts found for the given IDs" });
+        const postData = rows.map(r => ({ id: r.id, text: (r.full_text || r.title || "").slice(0, 500), likes: r.likes || 0, comments: r.comments || 0, shares: r.shares || 0, impressions: r.impressions || 0 }));
+        const aiRes = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` }, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "system", content: "You are a social media analyst. Analyze the sentiment and performance of LinkedIn posts. For each post, provide sentiment (positive/neutral/negative), a score (0-100), and a brief insight. Also provide an overall summary. Return ONLY valid JSON with 'posts' array (each with 'id', 'sentiment', 'score', 'insight') and 'summary' string. No markdown." }, { role: "user", content: `Analyze sentiment and performance of these LinkedIn posts:\n${JSON.stringify(postData)}` }], temperature: 0.5 }) });
+        const aiData = await aiRes.json();
+        if (!aiRes.ok) return res.status(aiRes.status).json({ error: "DeepSeek API error", details: aiData });
+        const content = aiData.choices?.[0]?.message?.content || "{}";
+        try { const parsed = JSON.parse(content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim()); return res.json({ success: true, ...parsed }); } catch { return res.json({ success: true, raw: content }); }
+      } catch (e) { return res.status(500).json({ error: "Sentiment analysis failed", message: e.message }); }
+    }
+
+    // ---- AI Reports Query ----
+    if (route === "ai/reports-query") {
+      if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+      const { question } = req.body;
+      if (!question) return res.status(400).json({ error: "question is required" });
+      const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+      if (!DEEPSEEK_API_KEY) return res.status(500).json({ error: "DEEPSEEK_API_KEY not configured" });
+      try {
+        const [postsRes, metricsRes, engagementRes] = await Promise.all([
+          query("SELECT COUNT(*) as total_posts, SUM(likes) as total_likes, SUM(comments) as total_comments, SUM(shares) as total_shares, SUM(impressions) as total_impressions, AVG(likes) as avg_likes, AVG(comments) as avg_comments, AVG(shares) as avg_shares, AVG(impressions) as avg_impressions FROM posts"),
+          query("SELECT COUNT(*) as total_entries, AVG(followers) as avg_followers, AVG(impressions) as avg_impressions, AVG(engagements) as avg_engagements, AVG(engagement_rate) as avg_engagement_rate, MAX(followers) as max_followers FROM page_metrics"),
+          query("SELECT COUNT(*) as total_engagements, COUNT(DISTINCT employee_id) as active_employees, COUNT(DISTINCT post_id) as posts_engaged FROM engagement")
+        ]);
+        const summaryData = { posts: postsRes.rows[0], metrics: metricsRes.rows[0], engagement: engagementRes.rows[0] };
+        const aiRes = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` }, body: JSON.stringify({ model: "deepseek-chat", messages: [{ role: "system", content: "You are a LinkedIn analytics assistant for a social media tracking tool. Answer questions about the company's LinkedIn performance based on the provided data. Be concise, data-driven, and actionable. If the data doesn't contain enough info to answer, say so." }, { role: "user", content: `Here is our LinkedIn performance data:\n${JSON.stringify(summaryData)}\n\nQuestion: ${question}` }], temperature: 0.5 }) });
+        const aiData = await aiRes.json();
+        if (!aiRes.ok) return res.status(aiRes.status).json({ error: "DeepSeek API error", details: aiData });
+        return res.json({ success: true, answer: aiData.choices?.[0]?.message?.content || "", data: summaryData, usage: aiData.usage });
+      } catch (e) { return res.status(500).json({ error: "Reports query failed", message: e.message }); }
+    }
+
+    // ---- AI Brand Voice ----
+    if (route === "ai/brand-voice") {
+      if (req.method === "GET") {
+        try { const { rows } = await query("SELECT config_value FROM api_config WHERE config_key='brand_voice'"); return res.json({ success: true, brandVoice: rows[0]?.config_value || "" }); }
+        catch (e) { return res.status(500).json({ error: e.message }); }
+      }
+      if (req.method === "POST") {
+        const { brandVoice } = req.body;
+        try { await query("INSERT INTO api_config (config_key,config_value) VALUES ('brand_voice',$1) ON CONFLICT (config_key) DO UPDATE SET config_value=$1,updated_at=NOW()", [brandVoice || ""]); return res.json({ success: true }); }
+        catch (e) { return res.status(500).json({ error: e.message }); }
+      }
+      return res.status(405).json({ error: "Method not allowed" });
+    }
+
+    // ---- Bulk Schedule ----
+    if (route === "bulk-schedule") {
+      if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+      const { posts } = req.body;
+      if (!posts || !Array.isArray(posts) || posts.length === 0) return res.status(400).json({ error: "posts array is required" });
+      try {
+        let count = 0;
+        for (const p of posts) {
+          if (!p.text || !p.scheduled_at || !p.org_id) continue;
+          await query("INSERT INTO scheduled_posts (text,page,url,scheduled_at,org_id,status) VALUES ($1,$2,$3,$4,$5,'pending')", [p.text, p.page || null, p.url || null, p.scheduled_at, p.org_id]);
+          count++;
+        }
+        return res.json({ success: true, scheduled: count });
+      } catch (e) { return res.status(500).json({ error: "Bulk schedule failed", message: e.message }); }
+    }
+
     // ---- 404 ----
     return res.status(404).json({ error: "Not found", path: route });
 
