@@ -6,7 +6,12 @@ export const config = {
 };
 
 export default async function handler(req, res) {
-  const segments = req.query.path || [];
+  let segments = req.query.path || [];
+  // Fallback: parse path from URL if query.path is empty
+  if (segments.length === 0) {
+    const urlPath = (req.url || "").replace(/^\/api\//, "").split("?")[0];
+    if (urlPath) segments = urlPath.split("/").filter(Boolean);
+  }
   const route = segments.join("/");
 
   // Share page and image routes serve HTML/binary — skip CORS
