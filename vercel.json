@@ -12,7 +12,8 @@
     }
   ],
   "rewrites": [
-    { "source": "/s/:id", "destination": "/api/s/:id" },
-    { "source": "/img/:id", "destination": "/api/img/:id" }
+    { "source": "/s/:id", "destination": "/api/router?path=s/:id" },
+    { "source": "/img/:id", "destination": "/api/router?path=img/:id" },
+    { "source": "/api/:path*", "destination": "/api/router?path=:path*" }
   ]
 }

@@ -1,3 +1,2 @@
-export default function handler(req, res) {
-  res.json({ status: "ok", server: "Social Tracker API (Vercel)" });
-}
+// /api → delegate to the single router so behavior is identical everywhere.
+export { default, config } from "./router.js";
