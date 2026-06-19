@@ -157,19 +157,49 @@ export default async function handler(req, res) {
       const token = await getTokenOrDB(req);
       if(!token) return res.status(401).json({error:"LinkedIn token not configured. Ask admin to set it in Settings."});
       const orgId = segments[2];
+      const pageName=orgId==="15078287"?"techwaukee":"gorecruitai";
+
+      // Helper: liFetch with 7s timeout to stay within Vercel's 10s limit
+      const liFetchT = (url) => {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 7000);
+        return liFetch(url, token, { signal: ctrl.signal }).then(r => { clearTimeout(timer); return r; }).catch(() => { clearTimeout(timer); return { error: true, data: {} }; });
+      };
+
       const LI="https://api.linkedin.com/v2";
       const urn=encodeURIComponent(`urn:li:organization:${orgId}`);
-      const [networkSize,shareStats,pageStats] = await Promise.all([
-        liFetch(`${LI}/networkSizes/${urn}?edgeType=CompanyFollowedByMember`,token),
-        liFetch(`${LI}/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${urn}`,token),
-        liFetch(`${LI}/organizationPageStatistics?q=organization&organization=${urn}`,token),
-      ]);
-      const totalFollowers=networkSize.data?.firstDegreeSize||0;
-      const sStats=(shareStats.data?.elements||[])[0]?.totalShareStatistics||{};
-      let pageViews=0,uniqueVisitors=0;
-      (pageStats.data?.elements||[]).forEach(el=>{if(el.totalPageStatistics){pageViews=el.totalPageStatistics.views?.allPageViews?.pageViews||0;uniqueVisitors=el.totalPageStatistics.views?.allPageViews?.uniquePageViews||0;}});
-      const result={orgId,timestamp:new Date().toISOString(),totalFollowers,impressions:sStats.impressionCount||0,clicks:sStats.clickCount||0,likes:sStats.likeCount||0,comments:sStats.commentCount||0,shares:sStats.shareCount||0,engagement:sStats.engagement||0,pageViews,uniqueVisitors};
-      try{await query("INSERT INTO page_metrics (metric_date,page,followers,impressions,engagements,page_views,unique_visitors,clicks,source) VALUES (CURRENT_DATE,'techwaukee',$1,$2,$3,$4,$5,$6,'api') ON CONFLICT DO NOTHING",[totalFollowers,result.impressions,result.likes+result.comments+result.shares,pageViews,uniqueVisitors,result.clicks]);}catch{}
+      let totalFollowers=0, impressions=0, clicks=0, likes=0, comments=0, shares=0, pageViews=0, uniqueVisitors=0;
+      let liveOk = false;
+
+      try {
+        const [networkSize,shareStats,pageStats] = await Promise.all([
+          liFetchT(`${LI}/networkSizes/${urn}?edgeType=CompanyFollowedByMember`),
+          liFetchT(`${LI}/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${urn}`),
+          liFetchT(`${LI}/organizationPageStatistics?q=organization&organization=${urn}`),
+        ]);
+        totalFollowers=networkSize.data?.firstDegreeSize||0;
+        const sStats=(shareStats.data?.elements||[])[0]?.totalShareStatistics||{};
+        impressions=sStats.impressionCount||0; clicks=sStats.clickCount||0;
+        likes=sStats.likeCount||0; comments=sStats.commentCount||0; shares=sStats.shareCount||0;
+        (pageStats.data?.elements||[]).forEach(el=>{if(el.totalPageStatistics){pageViews=el.totalPageStatistics.views?.allPageViews?.pageViews||0;uniqueVisitors=el.totalPageStatistics.views?.allPageViews?.uniquePageViews||0;}});
+        if(totalFollowers>0) liveOk=true;
+      } catch(e) { /* fall through to DB */ }
+
+      // If live API failed/timed out, return latest from DB
+      if(!liveOk) {
+        try {
+          const { rows } = await query("SELECT * FROM page_metrics WHERE page=$1 ORDER BY metric_date DESC LIMIT 1",[pageName]);
+          if(rows.length) {
+            const m=rows[0];
+            return res.json({orgId,timestamp:m.metric_date,totalFollowers:m.followers||0,newFollowers:m.new_followers||0,postImpressions:m.impressions||0,pageVisitors:m.unique_visitors||0,impressions:m.impressions||0,clicks:m.clicks||0,likes:0,comments:0,shares:0,engagement:0,pageViews:m.page_views||0,uniqueVisitors:m.unique_visitors||0,source:"database"});
+          }
+        } catch(e) {}
+        // No DB data either — return zeros
+        return res.json({orgId,timestamp:new Date().toISOString(),totalFollowers:0,newFollowers:0,postImpressions:0,pageVisitors:0,impressions:0,clicks:0,likes:0,comments:0,shares:0,engagement:0,pageViews:0,uniqueVisitors:0,source:"none"});
+      }
+
+      const result={orgId,timestamp:new Date().toISOString(),totalFollowers,newFollowers:0,postImpressions:impressions,pageVisitors:uniqueVisitors,impressions,clicks,likes,comments,shares,engagement:0,pageViews,uniqueVisitors,source:"linkedin"};
+      try{await query("INSERT INTO page_metrics (metric_date,page,followers,impressions,engagements,page_views,unique_visitors,clicks,source) VALUES (CURRENT_DATE,$1,$2,$3,$4,$5,$6,$7,'api') ON CONFLICT DO NOTHING",[pageName,totalFollowers,impressions,likes+comments+shares,pageViews,uniqueVisitors,clicks]);}catch{}
       return res.json(result);
     }
 
