@@ -236,10 +236,10 @@ export default async function handler(req, res) {
     }
 
     // ---- LinkedIn Post Stats ----
-    if (segments[0]==="linkedin" && segments[1]==="post-stats" && segments[2]) {
+    if (segments[0]==="linkedin" && segments[1]==="post-stats" && (segments[2] || req.query.urn)) {
       const token=await getTokenOrDB(req);
       if(!token)return res.status(401).json({error:"Token not configured"});
-      const urnParam=segments[2];const decoded=decodeURIComponent(urnParam);
+      const urnParam=req.query.urn || segments[2];const decoded=decodeURIComponent(urnParam);
       let result=await liFetch(`https://api.linkedin.com/rest/socialMetadata/${encodeURIComponent(decoded)}`,token);
       if(result.error){result=await liFetch(`https://api.linkedin.com/v2/socialActions/${encodeURIComponent(decoded)}`,token);}
       if(result.error)return res.status(result.status).json({error:result.data?.message||"Failed to fetch stats",data:result.data});
