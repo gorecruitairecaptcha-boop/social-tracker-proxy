@@ -5,6 +5,33 @@ export const config = {
   api: { bodyParser: { sizeLimit: "50mb" } }
 };
 
+// Fetch live engagement for every post published/linked in the last 14 days and update
+// the DB. Run once a day by the cron so each post is monitored for two weeks.
+async function syncRecentPostStats(token, budgetMs = 20000) {
+  if (!token) return { synced: 0, candidates: 0, error: "no token" };
+  const { rows } = await query(
+    "SELECT id, linkedin_urn FROM posts WHERE linkedin_urn IS NOT NULL AND linkedin_urn <> '' AND created_at >= NOW() - INTERVAL '14 days' ORDER BY created_at DESC LIMIT 40"
+  );
+  let synced = 0;
+  const start = Date.now();
+  for (const p of rows) {
+    if (Date.now() - start > budgetMs) break; // stay within the function time limit
+    try {
+      const urn = p.linkedin_urn;
+      let r = await liFetch(`https://api.linkedin.com/rest/socialMetadata/${encodeURIComponent(urn)}`, token);
+      if (r.error) r = await liFetch(`https://api.linkedin.com/v2/socialActions/${encodeURIComponent(urn)}`, token);
+      if (r.error) continue;
+      const d = r.data;
+      const likeCount = d.likesSummary?.totalLikes ?? d.likes?.length ?? d.numLikes ?? 0;
+      const commentCount = d.commentsSummary?.aggregatedTotalComments ?? d.comments?.length ?? d.numComments ?? 0;
+      const shareCount = d.sharesSummary?.totalShares ?? d.numShares ?? 0;
+      await query("UPDATE posts SET likes=$1, comments=$2, shares=$3, last_synced_at=NOW() WHERE id=$4", [likeCount, commentCount, shareCount, p.id]);
+      synced++;
+    } catch {}
+  }
+  return { synced, candidates: rows.length };
+}
+
 export default async function handler(req, res) {
   // `path` arrives from the vercel.json rewrite as a "a/b/c" string (or an array on
   // native catch-all routing). Normalize to an array of segments either way.
@@ -42,15 +69,46 @@ export default async function handler(req, res) {
       return res.json({ user: rows[0] });
     }
 
+    // ---- Auth ----
+    if (route === "auth/login") {
+      if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+      const { email, password } = req.body;
+      if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+      const { rows } = await query("SELECT id,name,email,role,region,is_active FROM users WHERE email=$1 AND password=$2 AND is_active=true", [email.trim().toLowerCase(), password]);
+      if (rows.length === 0) return res.status(401).json({ error: "Invalid email or password" });
+      return res.json(rows[0]);
+    }
+
     // ---- Users ----
     if (route === "users") {
-      if (req.method === "GET") { const { rows } = await query("SELECT id,name,email,password,role,region,is_active FROM users ORDER BY role,name"); return res.json(rows); }
-      if (req.method === "POST") { const { name, email, password, role, region } = req.body; const { rows } = await query("INSERT INTO users (name,email,password,role,region) VALUES ($1,$2,$3,$4,$5) RETURNING *", [name, email, password, role||"member", region||"India"]); return res.json(rows[0]); }
+      if (req.method === "GET") { const { rows } = await query("SELECT id,name,email,role,region,is_active,created_at FROM users ORDER BY role,name"); return res.json(rows); }
+      if (req.method === "POST") {
+        const { name, email, password, role, region } = req.body;
+        if (!name || !email || !password) return res.status(400).json({ error: "Name, email, and password are required" });
+        // Check duplicate email
+        const { rows: existing } = await query("SELECT id FROM users WHERE email=$1", [email.trim().toLowerCase()]);
+        if (existing.length > 0) return res.status(409).json({ error: "Email already exists" });
+        const { rows } = await query("INSERT INTO users (name,email,password,role,region) VALUES ($1,$2,$3,$4,$5) RETURNING id,name,email,role,region,is_active,created_at", [name, email.trim().toLowerCase(), password, role||"member", region||"India"]);
+        return res.json(rows[0]);
+      }
       return res.status(405).json({ error: "Method not allowed" });
     }
     if (segments[0] === "users" && segments[1]) {
       const id = segments[1];
-      if (req.method === "PUT") { const { name, email, password, role } = req.body; await query("UPDATE users SET name=$1,email=$2,password=$3,role=$4 WHERE id=$5", [name, email, password, role, id]); return res.json({ success: true }); }
+      if (req.method === "PUT") {
+        const { name, email, password, role, region, is_active } = req.body;
+        const sets = []; const vals = []; let idx = 1;
+        if (name !== undefined) { sets.push(`name=$${idx++}`); vals.push(name); }
+        if (email !== undefined) { sets.push(`email=$${idx++}`); vals.push(email); }
+        if (password) { sets.push(`password=$${idx++}`); vals.push(password); }
+        if (role !== undefined) { sets.push(`role=$${idx++}`); vals.push(role); }
+        if (region !== undefined) { sets.push(`region=$${idx++}`); vals.push(region); }
+        if (is_active !== undefined) { sets.push(`is_active=$${idx++}`); vals.push(is_active); }
+        if (sets.length === 0) return res.json({ success: true });
+        vals.push(id);
+        await query(`UPDATE users SET ${sets.join(",")} WHERE id=$${idx}`, vals);
+        return res.json({ success: true });
+      }
       if (req.method === "DELETE") { await query("UPDATE users SET is_active=false WHERE id=$1", [id]); return res.json({ success: true }); }
       return res.status(405).json({ error: "Method not allowed" });
     }
@@ -313,11 +371,17 @@ export default async function handler(req, res) {
       return res.send(Buffer.from(base64,"base64"));
     }
 
-    // ---- Cron: Check Scheduled Posts ----
+    // ---- Daily engagement sync (manual trigger; the daily cron runs it too) ----
+    if (route === "cron/sync-stats" || route === "sync-stats") {
+      const token = await getTokenOrDB(req);
+      const result = await syncRecentPostStats(token);
+      return res.json({ success: !result.error, ...result });
+    }
+
+    // ---- Cron: Check Scheduled Posts (+ daily engagement sync) ----
     if (route === "cron/check-scheduled") {
       if(req.headers.authorization!==`Bearer ${process.env.CRON_SECRET}`&&process.env.CRON_SECRET)return res.status(401).json({error:"Unauthorized"});
       const{rows}=await query("SELECT * FROM scheduled_posts WHERE status='pending' AND scheduled_at <= (NOW() AT TIME ZONE 'Asia/Kolkata')");
-      if(rows.length===0)return res.json({processed:0});
       let sharedToken=null;
       try{const tokenRes=await query("SELECT config_value FROM api_config WHERE config_key='linkedin_access_token'");sharedToken=tokenRes.rows[0]?.config_value||null;}catch{}
       let published=0,failed=0;
@@ -341,7 +405,9 @@ export default async function handler(req, res) {
           await query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Auto-published by scheduler',$4,$5,$6,'scheduler')",[post.page||"techwaukee",contentType,post.text.slice(0,300),post.text,liLink,liUrn]);published++;}
         }catch(e){await query("UPDATE scheduled_posts SET status='failed',error=$1 WHERE id=$2",[e.message,post.id]);failed++;}
       }
-      return res.json({processed:rows.length,published,failed});
+      let statsSynced=0;
+      try{ statsSynced=(await syncRecentPostStats(sharedToken)).synced; }catch{}
+      return res.json({processed:rows.length,published,failed,statsSynced});
     }
 
     // ---- Init DB ----
@@ -462,37 +528,4 @@ CREATE TABLE IF NOT EXISTS scheduled_posts (id SERIAL PRIMARY KEY,text TEXT NOT 
     // ---- AI Brand Voice ----
     if (route === "ai/brand-voice") {
       if (req.method === "GET") {
-        try { const { rows } = await query("SELECT config_value FROM api_config WHERE config_key='brand_voice'"); return res.json({ success: true, brandVoice: rows[0]?.config_value || "" }); }
-        catch (e) { return res.status(500).json({ error: e.message }); }
-      }
-      if (req.method === "POST") {
-        const { brandVoice } = req.body;
-        try { await query("INSERT INTO api_config (config_key,config_value) VALUES ('brand_voice',$1) ON CONFLICT (config_key) DO UPDATE SET config_value=$1,updated_at=NOW()", [brandVoice || ""]); return res.json({ success: true }); }
-        catch (e) { return res.status(500).json({ error: e.message }); }
-      }
-      return res.status(405).json({ error: "Method not allowed" });
-    }
-
-    // ---- Bulk Schedule ----
-    if (route === "bulk-schedule") {
-      if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-      const { posts } = req.body;
-      if (!posts || !Array.isArray(posts) || posts.length === 0) return res.status(400).json({ error: "posts array is required" });
-      try {
-        let count = 0;
-        for (const p of posts) {
-          if (!p.text || !p.scheduled_at || !p.org_id) continue;
-          await query("INSERT INTO scheduled_posts (text,page,url,scheduled_at,org_id,status) VALUES ($1,$2,$3,$4,$5,'pending')", [p.text, p.page || null, p.url || null, p.scheduled_at, p.org_id]);
-          count++;
-        }
-        return res.json({ success: true, scheduled: count });
-      } catch (e) { return res.status(500).json({ error: "Bulk schedule failed", message: e.message }); }
-    }
-
-    // ---- 404 ----
-    return res.status(404).json({ error: "Not found", path: route });
-
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
-}
+        try { const { r
