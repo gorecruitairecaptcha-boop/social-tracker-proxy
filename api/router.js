@@ -115,13 +115,38 @@ export default async function handler(req, res) {
 
     // ---- Tasks ----
     if (route === "tasks") {
-      if (req.method === "GET") { const { rows } = await query("SELECT * FROM tasks ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, due_date ASC NULLS LAST"); return res.json(rows); }
-      if (req.method === "POST") { const { title,description,category,region,page,priority,target_value,due_date,recurring,recurrence,status,assigned_to,assigned_by } = req.body; const { rows } = await query("INSERT INTO tasks (title,description,category,region,page,priority,target_value,due_date,recurring,recurrence,status,assigned_to,assigned_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *", [title,description,category,region,page,priority,target_value,due_date||null,recurring,recurrence,status||"pending",assigned_to,assigned_by]); return res.json(rows[0]); }
+      // Auto-migrate: add pages and recurrence_rule columns if missing
+      try { await query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pages TEXT, ADD COLUMN IF NOT EXISTS recurrence_rule TEXT, ADD COLUMN IF NOT EXISTS post_urn VARCHAR(300)"); } catch {}
+      if (req.method === "GET") { const { rows } = await query("SELECT * FROM tasks ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'in_progress' THEN 2 ELSE 3 END, CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, due_date ASC NULLS LAST"); return res.json(rows); }
+      if (req.method === "POST") {
+        const { title,description,category,region,priority,due_date,status,assigned_to,assigned_by,pages,recurrence_rule,post_urn } = req.body;
+        const { rows } = await query("INSERT INTO tasks (title,description,category,region,priority,due_date,status,assigned_to,assigned_by,pages,recurrence_rule,post_urn) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *",
+          [title,description||"",category||"daily",region||"Global",priority||"medium",due_date||null,status||"pending",assigned_to,assigned_by,pages||"",recurrence_rule||"",post_urn||null]);
+        return res.json(rows[0]);
+      }
       return res.status(405).json({ error: "Method not allowed" });
     }
     if (segments[0] === "tasks" && segments[1]) {
       const id = segments[1];
-      if (req.method === "PUT") { const { status } = req.body; await query("UPDATE tasks SET status=$1 WHERE id=$2", [status, id]); return res.json({ success: true }); }
+      if (req.method === "PUT") {
+        const { title,description,category,region,priority,due_date,status,assigned_to,pages,recurrence_rule,post_urn } = req.body;
+        const sets=[],vals=[];let idx=1;
+        if(title!==undefined){sets.push(`title=$${idx++}`);vals.push(title);}
+        if(description!==undefined){sets.push(`description=$${idx++}`);vals.push(description);}
+        if(category!==undefined){sets.push(`category=$${idx++}`);vals.push(category);}
+        if(region!==undefined){sets.push(`region=$${idx++}`);vals.push(region);}
+        if(priority!==undefined){sets.push(`priority=$${idx++}`);vals.push(priority);}
+        if(due_date!==undefined){sets.push(`due_date=$${idx++}`);vals.push(due_date||null);}
+        if(status!==undefined){sets.push(`status=$${idx++}`);vals.push(status);}
+        if(assigned_to!==undefined){sets.push(`assigned_to=$${idx++}`);vals.push(assigned_to);}
+        if(pages!==undefined){sets.push(`pages=$${idx++}`);vals.push(pages);}
+        if(recurrence_rule!==undefined){sets.push(`recurrence_rule=$${idx++}`);vals.push(recurrence_rule);}
+        if(post_urn!==undefined){sets.push(`post_urn=$${idx++}`);vals.push(post_urn);}
+        if(sets.length===0)return res.json({success:true});
+        vals.push(id);
+        const { rows } = await query(`UPDATE tasks SET ${sets.join(",")} WHERE id=$${idx} RETURNING *`,vals);
+        return res.json(rows[0] || {success:true});
+      }
       if (req.method === "DELETE") { await query("DELETE FROM tasks WHERE id=$1", [id]); return res.json({ success: true }); }
       return res.status(405).json({ error: "Method not allowed" });
     }
@@ -169,7 +194,7 @@ export default async function handler(req, res) {
       if (req.method === "POST") {
         const { metric_date,page,followers,new_followers,impressions,engagements,profile_views,post_reach,page_views,unique_visitors,clicks,source } = req.body;
         const rate = impressions>0?((engagements/impressions)*100).toFixed(2):0;
-        const { rows } = await query("INSERT INTO page_metrics (metric_date,page,followers,new_followers,impressions,engagements,profile_views,post_reach,page_views,unique_visitors,clicks,engagement_rate,source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *",
+        const { rows } = await query("INSERT INTO page_metrics (metric_date,page,followers,new_followers,impressions,engagements,profile_views,post_reach,page_views,unique_visitors,clicks,engagement_rate,source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (metric_date,page) DO UPDATE SET followers=EXCLUDED.followers,new_followers=EXCLUDED.new_followers,impressions=EXCLUDED.impressions,engagements=EXCLUDED.engagements,profile_views=EXCLUDED.profile_views,post_reach=EXCLUDED.post_reach,page_views=EXCLUDED.page_views,unique_visitors=EXCLUDED.unique_visitors,clicks=EXCLUDED.clicks,engagement_rate=EXCLUDED.engagement_rate,source=EXCLUDED.source RETURNING *",
           [metric_date,page,followers||0,new_followers||0,impressions||0,engagements||0,profile_views||0,post_reach||0,page_views||0,unique_visitors||0,clicks||0,rate,source||"manual"]);
         return res.json(rows[0]);
       }
@@ -240,13 +265,27 @@ export default async function handler(req, res) {
       const pageName=orgId==="15078287"?"techwaukee":"gorecruitai";
       const LI="https://api.linkedin.com/v2";
       const urn=encodeURIComponent(`urn:li:organization:${orgId}`);
-      let totalFollowers=0,impressions=0,clicks=0,likes=0,comments=0,shares=0,pageViews=0,uniqueVisitors=0;
-      // Call LinkedIn APIs one at a time to avoid timeout
-      try{const r=await liFetch(`${LI}/networkSizes/${urn}?edgeType=CompanyFollowedByMember`,token);totalFollowers=r.data?.firstDegreeSize||0;}catch{}
-      try{const r=await liFetch(`${LI}/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${urn}`,token);const s=(r.data?.elements||[])[0]?.totalShareStatistics||{};impressions=s.impressionCount||0;clicks=s.clickCount||0;likes=s.likeCount||0;comments=s.commentCount||0;shares=s.shareCount||0;}catch{}
-      try{const r=await liFetch(`${LI}/organizationPageStatistics?q=organization&organization=${urn}`,token);(r.data?.elements||[]).forEach(el=>{if(el.totalPageStatistics){pageViews=el.totalPageStatistics.views?.allPageViews?.pageViews||0;uniqueVisitors=el.totalPageStatistics.views?.allPageViews?.uniquePageViews||0;}});}catch{}
-      try{await query("INSERT INTO page_metrics (metric_date,page,followers,impressions,engagements,page_views,unique_visitors,clicks,source) VALUES (CURRENT_DATE,$1,$2,$3,$4,$5,$6,$7,'api') ON CONFLICT DO NOTHING",[pageName,totalFollowers,impressions,likes+comments+shares,pageViews,uniqueVisitors,clicks]);}catch{}
-      return res.json({orgId,timestamp:new Date().toISOString(),totalFollowers,newFollowers:0,postImpressions:impressions,pageVisitors:uniqueVisitors,impressions,clicks,likes,comments,shares,pageViews,uniqueVisitors,source:"linkedin"});
+      let totalFollowers=0,impressions=0,clicks=0,likes=0,comments=0,shares=0,pageViews=0,uniqueVisitors=0,followerGains=0;
+      // Run all LinkedIn API calls in PARALLEL to stay within Vercel's 30s function timeout.
+      // Each liFetch has its own 4s abort timeout so worst case is ~4s total, not 4×4=16s.
+      const end=Date.now(), start=end-1000*60*60*24*3;
+      const ti=encodeURIComponent(`(timeRange:(start:${start},end:${end}),timeGranularityType:DAY)`);
+      const [r1,r2,r3,r4] = await Promise.allSettled([
+        liFetch(`${LI}/networkSizes/${urn}?edgeType=CompanyFollowedByMember`,token),
+        liFetch(`${LI}/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${urn}`,token),
+        liFetch(`${LI}/organizationPageStatistics?q=organization&organization=${urn}`,token),
+        liFetch(`${LI}/organizationalEntityFollowerStatistics?q=organizationalEntity&organizationalEntity=${urn}&timeIntervals=${ti}`,token),
+      ]);
+      if(r1.status==="fulfilled"&&!r1.value.error) totalFollowers=r1.value.data?.firstDegreeSize||0;
+      if(r2.status==="fulfilled"&&!r2.value.error){const s=(r2.value.data?.elements||[])[0]?.totalShareStatistics||{};impressions=s.impressionCount||0;clicks=s.clickCount||0;likes=s.likeCount||0;comments=s.commentCount||0;shares=s.shareCount||0;}
+      if(r3.status==="fulfilled"&&!r3.value.error)(r3.value.data?.elements||[]).forEach(el=>{if(el.totalPageStatistics){pageViews=el.totalPageStatistics.views?.allPageViews?.pageViews||0;uniqueVisitors=el.totalPageStatistics.views?.allPageViews?.uniquePageViews||0;}});
+      if(r4.status==="fulfilled"&&!r4.value.error){const els=r4.value.data?.elements||[];const last=els[els.length-1];const fg=last?.followerGains;if(fg) followerGains=(fg.organicFollowerGain||0)+(fg.paidFollowerGain||0);}
+      // Check if ALL calls failed (likely expired token) — report it
+      const allFailed=[r1,r2,r3,r4].every(r=>r.status==="rejected"||(r.status==="fulfilled"&&r.value.error));
+      const tokenExpired=allFailed&&[r1,r2,r3,r4].some(r=>r.status==="fulfilled"&&r.value.status===401);
+      if(tokenExpired) return res.json({orgId,timestamp:new Date().toISOString(),totalFollowers:0,error:"LinkedIn token expired. Please update it in Settings.",source:"token_expired"});
+      try{await query("INSERT INTO page_metrics (metric_date,page,followers,impressions,engagements,page_views,unique_visitors,clicks,source) VALUES ((NOW() AT TIME ZONE 'Asia/Kolkata')::date,$1,$2,$3,$4,$5,$6,$7,'api')",[pageName,totalFollowers,impressions,likes+comments+shares,pageViews,uniqueVisitors,clicks]);}catch{}
+      return res.json({orgId,timestamp:new Date().toISOString(),totalFollowers,newFollowers:followerGains,postImpressions:impressions,pageVisitors:uniqueVisitors,impressions,clicks,likes,comments,shares,pageViews,uniqueVisitors,followerGains,source:allFailed?"cached":"linkedin"});
     }
 
     // ---- LinkedIn Post (text) ----
@@ -261,7 +300,7 @@ export default async function handler(req, res) {
       if(result.error)return res.status(result.status).json({success:false,error:result.data?.message||"Failed",data:result.data});
       const liUrn=result.postUrn||null;const liLink=liUrn?`https://www.linkedin.com/feed/update/${liUrn}`:"";
       const pageName=orgId==="15078287"?"techwaukee":"gorecruitai";
-      try{await query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API',$4,$5,$6,'api')",[pageName,"Text Post",text.slice(0,300),text,liLink,liUrn]);}catch{}
+      try{await query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES ((NOW() AT TIME ZONE 'Asia/Kolkata')::date,$1,$2,$3,'Published via API',$4,$5,$6,'api')",[pageName,"Text Post",text.slice(0,300),text,liLink,liUrn]);}catch{}
       return res.json({success:true,data:result.data,linkedinUrl:liLink,linkedinUrn:liUrn,textLength:text.length});
     }
 
@@ -278,7 +317,7 @@ export default async function handler(req, res) {
       if(result.error)return res.status(result.status).json({success:false,error:result.data?.message||"Failed",data:result.data});
       const liUrn=result.postUrn||null;const liLink=liUrn?`https://www.linkedin.com/feed/update/${liUrn}`:"";
       const pageName=orgId==="15078287"?"techwaukee":"gorecruitai";
-      try{await query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Published via API',$4,$5,$6,'api')",[pageName,imageUrn?"Image Post":"Text Post",text.slice(0,300),text,liLink,liUrn]);}catch{}
+      try{await query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES ((NOW() AT TIME ZONE 'Asia/Kolkata')::date,$1,$2,$3,'Published via API',$4,$5,$6,'api')",[pageName,imageUrn?"Image Post":"Text Post",text.slice(0,300),text,liLink,liUrn]);}catch{}
       return res.json({success:true,data:result.data,linkedinUrl:liLink,linkedinUrn:liUrn,textLength:text.length});
     }
 
@@ -402,12 +441,24 @@ export default async function handler(req, res) {
           else{const liUrn=result.postUrn||null;const liLink=liUrn?`https://www.linkedin.com/feed/update/${liUrn}`:"";
           await query("UPDATE scheduled_posts SET status='published',published_at=NOW() WHERE id=$1",[post.id]);
           const contentType=uploadedImageUrn?"Image Post":"Scheduled Post";
-          await query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES (CURRENT_DATE,$1,$2,$3,'Auto-published by scheduler',$4,$5,$6,'scheduler')",[post.page||"techwaukee",contentType,post.text.slice(0,300),post.text,liLink,liUrn]);published++;}
+          await query("INSERT INTO posts (post_date,page,content_type,title,notes,full_text,post_link,linkedin_urn,added_by) VALUES ((NOW() AT TIME ZONE 'Asia/Kolkata')::date,$1,$2,$3,'Auto-published by scheduler',$4,$5,$6,'scheduler')",[post.page||"techwaukee",contentType,post.text.slice(0,300),post.text,liLink,liUrn]);published++;}
         }catch(e){await query("UPDATE scheduled_posts SET status='failed',error=$1 WHERE id=$2",[e.message,post.id]);failed++;}
       }
       let statsSynced=0;
       try{ statsSynced=(await syncRecentPostStats(sharedToken)).synced; }catch{}
       return res.json({processed:rows.length,published,failed,statsSynced});
+    }
+
+    // ---- Admin: de-duplicate page_metrics + add unique index (safe to run repeatedly) ----
+    if (route === "admin/dedupe-metrics") {
+      // Remove duplicate rows, keeping the most recent (highest id) per date+page...
+      const del = await query("DELETE FROM page_metrics a USING page_metrics b WHERE a.page=b.page AND a.metric_date=b.metric_date AND a.id < b.id");
+      // ...then add the unique index so future syncs upsert instead of duplicating.
+      await query("CREATE UNIQUE INDEX IF NOT EXISTS page_metrics_date_page_uniq ON page_metrics (metric_date, page)");
+      // Column for the Unfollowed report (LinkedIn-reported follower gains per day).
+      await query("ALTER TABLE page_metrics ADD COLUMN IF NOT EXISTS follower_gains INT DEFAULT 0");
+      const { rows } = await query("SELECT COUNT(*)::int AS c FROM page_metrics");
+      return res.json({ success: true, deletedDuplicates: del.rowCount, remainingRows: rows[0].c });
     }
 
     // ---- Init DB ----
@@ -419,7 +470,7 @@ export default async function handler(req, res) {
 CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY,title VARCHAR(300) NOT NULL,description TEXT,category VARCHAR(50),region VARCHAR(20) DEFAULT 'all',page VARCHAR(20) DEFAULT 'both',priority VARCHAR(10) DEFAULT 'medium',target_value INT DEFAULT 1,due_date DATE,recurring BOOLEAN DEFAULT false,recurrence VARCHAR(20) DEFAULT 'daily',status VARCHAR(20) DEFAULT 'pending',assigned_to VARCHAR(50),assigned_by VARCHAR(50),created_at TIMESTAMP DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS task_completions (id SERIAL PRIMARY KEY,task_id INT REFERENCES tasks(id) ON DELETE CASCADE,user_id INT REFERENCES users(id) ON DELETE CASCADE,completion_date DATE NOT NULL,status VARCHAR(20) DEFAULT 'pending',value INT DEFAULT 0,notes TEXT,link VARCHAR(500),updated_at TIMESTAMP DEFAULT NOW(),UNIQUE(task_id,user_id,completion_date));
 CREATE TABLE IF NOT EXISTS posts (id SERIAL PRIMARY KEY,post_date DATE NOT NULL,page VARCHAR(20) NOT NULL,content_type VARCHAR(50),title VARCHAR(300),notes TEXT,full_text TEXT,hashtags VARCHAR(500),likes INT DEFAULT 0,comments INT DEFAULT 0,shares INT DEFAULT 0,impressions INT DEFAULT 0,post_link VARCHAR(500),linkedin_urn VARCHAR(300),added_by VARCHAR(50),last_synced_at TIMESTAMP,image_url TEXT,created_at TIMESTAMP DEFAULT NOW());
-CREATE TABLE IF NOT EXISTS page_metrics (id SERIAL PRIMARY KEY,metric_date DATE NOT NULL,page VARCHAR(20) NOT NULL,followers INT DEFAULT 0,new_followers INT DEFAULT 0,impressions INT DEFAULT 0,engagements INT DEFAULT 0,profile_views INT DEFAULT 0,post_reach INT DEFAULT 0,page_views INT DEFAULT 0,unique_visitors INT DEFAULT 0,clicks INT DEFAULT 0,engagement_rate DECIMAL(5,2) DEFAULT 0,source VARCHAR(20) DEFAULT 'manual',created_at TIMESTAMP DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS page_metrics (id SERIAL PRIMARY KEY,metric_date DATE NOT NULL,page VARCHAR(20) NOT NULL,followers INT DEFAULT 0,new_followers INT DEFAULT 0,impressions INT DEFAULT 0,engagements INT DEFAULT 0,profile_views INT DEFAULT 0,post_reach INT DEFAULT 0,page_views INT DEFAULT 0,unique_visitors INT DEFAULT 0,clicks INT DEFAULT 0,engagement_rate DECIMAL(5,2) DEFAULT 0,follower_gains INT DEFAULT 0,source VARCHAR(20) DEFAULT 'manual',created_at TIMESTAMP DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS employees (id SERIAL PRIMARY KEY,name VARCHAR(100) NOT NULL,title VARCHAR(100),team VARCHAR(50),region VARCHAR(20) DEFAULT 'India',linkedin_url VARCHAR(300),photo_url VARCHAR(300),created_at TIMESTAMP DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS engagement (id SERIAL PRIMARY KEY,post_id VARCHAR(50) NOT NULL,employee_id VARCHAR(50) NOT NULL,type VARCHAR(20) NOT NULL,date DATE NOT NULL,note TEXT,created_at TIMESTAMP DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS api_config (id SERIAL PRIMARY KEY,config_key VARCHAR(50) UNIQUE NOT NULL,config_value TEXT,updated_at TIMESTAMP DEFAULT NOW());
@@ -528,4 +579,37 @@ CREATE TABLE IF NOT EXISTS scheduled_posts (id SERIAL PRIMARY KEY,text TEXT NOT 
     // ---- AI Brand Voice ----
     if (route === "ai/brand-voice") {
       if (req.method === "GET") {
-        try { const { r
+        try { const { rows } = await query("SELECT config_value FROM api_config WHERE config_key='brand_voice'"); return res.json({ success: true, brandVoice: rows[0]?.config_value || "" }); }
+        catch (e) { return res.status(500).json({ error: e.message }); }
+      }
+      if (req.method === "POST") {
+        const { brandVoice } = req.body;
+        try { await query("INSERT INTO api_config (config_key,config_value) VALUES ('brand_voice',$1) ON CONFLICT (config_key) DO UPDATE SET config_value=$1,updated_at=NOW()", [brandVoice || ""]); return res.json({ success: true }); }
+        catch (e) { return res.status(500).json({ error: e.message }); }
+      }
+      return res.status(405).json({ error: "Method not allowed" });
+    }
+
+    // ---- Bulk Schedule ----
+    if (route === "bulk-schedule") {
+      if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+      const { posts } = req.body;
+      if (!posts || !Array.isArray(posts) || posts.length === 0) return res.status(400).json({ error: "posts array is required" });
+      try {
+        let count = 0;
+        for (const p of posts) {
+          if (!p.text || !p.scheduled_at || !p.org_id) continue;
+          await query("INSERT INTO scheduled_posts (text,page,url,scheduled_at,org_id,status) VALUES ($1,$2,$3,$4,$5,'pending')", [p.text, p.page || null, p.url || null, p.scheduled_at, p.org_id]);
+          count++;
+        }
+        return res.json({ success: true, scheduled: count });
+      } catch (e) { return res.status(500).json({ error: "Bulk schedule failed", message: e.message }); }
+    }
+
+    // ---- 404 ----
+    return res.status(404).json({ error: "Not found", path: route });
+
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
